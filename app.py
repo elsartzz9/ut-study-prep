@@ -2,20 +2,19 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 from hashlib import sha256
 import html
 import json
 import os
-from typing import Any
+import random
+import re
+from typing import Any, Literal
 
+from openai import OpenAI
+from pydantic import BaseModel, Field, model_validator
 import streamlit as st
-
-from ut_study_prep.ai import DEFAULT_MODEL, build_ai_study_pack
-from ut_study_prep.analysis import build_local_study_pack
-from ut_study_prep.models import StudyPack
-from ut_study_prep.tts import speech_controls
-
 
 st.set_page_config(
     page_title="UT Study Prep",
@@ -23,6 +22,403 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+# -----------------------------------------------------------------------------
+# Typed study-pack models
+# -----------------------------------------------------------------------------
+
+
+class Prediction(BaseModel):
+    """A study priority inferred from the learner's own material."""
+
+    topic: str = Field(min_length=2, max_length=140)
+    rationale: str = Field(min_length=4, max_length=500)
+    confidence: Literal["High", "Medium", "Low"]
+
+
+class Flashcard(BaseModel):
+    """A prompt and answer pair for active recall."""
+
+    front: str = Field(min_length=2, max_length=240)
+    back: str = Field(min_length=2, max_length=800)
+
+
+class QuizQuestion(BaseModel):
+    """A multiple-choice question with a zero-based answer index."""
+
+    question: str = Field(min_length=4, max_length=500)
+    options: list[str] = Field(min_length=2, max_length=4)
+    correct_index: int = Field(ge=0, le=3)
+    explanation: str = Field(min_length=2, max_length=800)
+
+    @model_validator(mode="after")
+    def answer_must_exist(self) -> "QuizQuestion":
+        if self.correct_index >= len(self.options):
+            raise ValueError("correct_index must point to an available option")
+        return self
+
+
+class StudyPack(BaseModel):
+    """Everything produced for one tutorial session."""
+
+    summary: list[str] = Field(min_length=1, max_length=8)
+    key_terms: list[str] = Field(default_factory=list, max_length=12)
+    predictions: list[Prediction] = Field(default_factory=list, max_length=6)
+    flashcards: list[Flashcard] = Field(default_factory=list, max_length=10)
+    quiz: list[QuizQuestion] = Field(default_factory=list, max_length=8)
+
+
+# -----------------------------------------------------------------------------
+# Dependency-light local study engine (previously analysis.py)
+# -----------------------------------------------------------------------------
+
+
+STOP_WORDS = {
+    # English
+    "about", "after", "again", "against", "also", "among", "and", "are",
+    "because", "been", "before", "being", "between", "both", "but", "can",
+    "could", "does", "each", "from", "have", "into", "more", "most", "not",
+    "only", "other", "our", "should", "some", "such", "than", "that", "the",
+    "their", "then", "there", "these", "they", "this", "those", "through",
+    "under", "using", "very", "was", "were", "what", "when", "where", "which",
+    "while", "will", "with", "would", "your",
+    # Indonesian
+    "adalah", "agar", "akan", "anda", "antara", "atau", "bagi", "bahwa",
+    "banyak", "beberapa", "berikut", "dalam", "dapat", "dari", "dengan", "dia",
+    "digunakan", "hal", "harus", "hingga", "ini", "itu", "jadi", "jika", "juga",
+    "karena", "ke", "kemudian", "kepada", "lebih", "melalui", "memiliki", "menjadi",
+    "merupakan", "oleh", "pada", "para", "saat", "saling", "sebagai", "sebuah",
+    "secara", "setelah", "setiap", "sudah", "terdapat", "terhadap", "tersebut",
+    "tetapi", "tidak", "untuk", "yang",
+}
+
+TOKEN_RE = re.compile(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9_-]{2,}")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _clean_sentence(value: str) -> str:
+    value = re.sub(r"^[\s\-–—•*\d.)]+", "", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def split_sentences(text: str) -> list[str]:
+    """Return readable, de-duplicated sentences from pasted tutorial content."""
+
+    sentences: list[str] = []
+    seen: set[str] = set()
+    for piece in SENTENCE_SPLIT_RE.split(text.replace("\r", "\n")):
+        sentence = _clean_sentence(piece)
+        fingerprint = sentence.casefold()
+        if 28 <= len(sentence) <= 700 and fingerprint not in seen:
+            sentences.append(sentence)
+            seen.add(fingerprint)
+    return sentences
+
+
+def _tokens(text: str) -> list[str]:
+    return [
+        token.casefold()
+        for token in TOKEN_RE.findall(text)
+        if token.casefold() not in STOP_WORDS and not token.isdigit()
+    ]
+
+
+def extract_keywords(text: str, limit: int = 10) -> list[str]:
+    """Extract frequent concepts while preserving a natural display form."""
+
+    tokens = _tokens(text)
+    counts = Counter(tokens)
+    first_form: dict[str, str] = {}
+    for token in TOKEN_RE.findall(text):
+        lowered = token.casefold()
+        if lowered not in STOP_WORDS:
+            first_form.setdefault(lowered, token)
+
+    ranked = sorted(counts, key=lambda item: (-counts[item], tokens.index(item)))
+    return [first_form.get(item, item).strip("_- ") for item in ranked[:limit]]
+
+
+def _rank_sentences(sentences: list[str], keywords: list[str]) -> list[str]:
+    weights = {term.casefold(): len(keywords) - index for index, term in enumerate(keywords)}
+    scored: list[tuple[float, int, str]] = []
+    for index, sentence in enumerate(sentences):
+        sentence_tokens = _tokens(sentence)
+        if not sentence_tokens:
+            continue
+        score = sum(weights.get(token, 0) for token in set(sentence_tokens))
+        score /= max(len(sentence_tokens) ** 0.55, 1)
+        if 45 <= len(sentence) <= 260:
+            score += 1.5
+        scored.append((score, index, sentence))
+    return [item[2] for item in sorted(scored, key=lambda item: (-item[0], item[1]))]
+
+
+def _sentence_for_term(term: str, sentences: list[str]) -> str:
+    match = term.casefold()
+    for sentence in sentences:
+        if match in sentence.casefold():
+            return sentence
+    return sentences[0] if sentences else f"Review how {term} is defined and applied."
+
+
+def _prediction_terms(
+    material_keywords: list[str], discussion: str, assignments: str
+) -> list[tuple[str, str, str]]:
+    assessment_text = f"{discussion}\n{assignments}".strip()
+    assessment_keywords = extract_keywords(assessment_text, limit=8)
+    material_set = {item.casefold() for item in material_keywords}
+
+    predictions: list[tuple[str, str, str]] = []
+    used: set[str] = set()
+    for term in assessment_keywords:
+        lowered = term.casefold()
+        if lowered in used:
+            continue
+        confidence = "High" if lowered in material_set else "Medium"
+        rationale = (
+            "Appears in the tutorial material and is reinforced by a discussion or assignment prompt."
+            if confidence == "High"
+            else "Appears in a discussion or assignment prompt, so it is worth practicing as an applied concept."
+        )
+        predictions.append((term, rationale, confidence))
+        used.add(lowered)
+        if len(predictions) == 4:
+            return predictions
+
+    for term in material_keywords:
+        lowered = term.casefold()
+        if lowered not in used:
+            predictions.append(
+                (
+                    term,
+                    "Repeated in the session material, which makes it a strong candidate for definition, comparison, or application questions.",
+                    "Medium",
+                )
+            )
+            used.add(lowered)
+        if len(predictions) == 4:
+            break
+    return predictions
+
+
+def _make_quiz(
+    keywords: list[str], ranked_sentences: list[str], seed_text: str, limit: int = 5
+) -> list[QuizQuestion]:
+    if len(ranked_sentences) < 2:
+        return []
+
+    seed = int(sha256(seed_text.encode("utf-8")).hexdigest()[:16], 16)
+    rng = random.Random(seed)
+    quiz: list[QuizQuestion] = []
+    for term in keywords[:limit]:
+        correct = _sentence_for_term(term, ranked_sentences)
+        distractor_pool = [item for item in ranked_sentences if item != correct]
+        if not distractor_pool:
+            continue
+        distractors = distractor_pool[:3]
+        while len(distractors) < 3:
+            distractors.append(
+                f"The material does not connect {term} to any broader principle or example."
+            )
+        options = [correct, *distractors[:3]]
+        rng.shuffle(options)
+        quiz.append(
+            QuizQuestion(
+                question=f"Which statement best matches the material's treatment of “{term}”?",
+                options=options,
+                correct_index=options.index(correct),
+                explanation=f"The best answer is the statement taken directly from the session notes about {term}.",
+            )
+        )
+    return quiz
+
+
+def build_local_study_pack(
+    material: str,
+    discussion: str = "",
+    assignments: str = "",
+) -> StudyPack:
+    """Create an extractive study pack without an external AI service."""
+
+    combined = "\n".join(part for part in (material, discussion, assignments) if part.strip())
+    if len(combined.strip()) < 80:
+        raise ValueError("Add at least 80 characters of study material before generating a study pack.")
+
+    material_sentences = split_sentences(material)
+    all_sentences = split_sentences(combined)
+    if not all_sentences:
+        raise ValueError("The material needs a few complete sentences so it can be analyzed.")
+
+    keywords = extract_keywords(combined, limit=10)
+    ranked = _rank_sentences(material_sentences or all_sentences, keywords)
+    summary = ranked[:5] or all_sentences[:5]
+    predictions = [
+        Prediction(topic=topic, rationale=rationale, confidence=confidence)
+        for topic, rationale, confidence in _prediction_terms(keywords, discussion, assignments)
+    ]
+    flashcards = [
+        Flashcard(
+            front=f"Explain {term} in the context of this session.",
+            back=_sentence_for_term(term, ranked or all_sentences),
+        )
+        for term in keywords[:6]
+    ]
+    return StudyPack(
+        summary=summary,
+        key_terms=keywords,
+        predictions=predictions,
+        flashcards=flashcards,
+        quiz=_make_quiz(keywords, ranked or all_sentences, combined),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Optional OpenAI study engine (previously ai.py)
+# -----------------------------------------------------------------------------
+
+
+DEFAULT_MODEL = "gpt-6-luna"
+
+
+def build_ai_study_pack(
+    *,
+    session_number: int,
+    material: str,
+    discussion: str,
+    assignments: str,
+    api_key: str,
+    model: str = DEFAULT_MODEL,
+) -> StudyPack:
+    """Generate a schema-validated study pack with the Responses API."""
+
+    if not api_key:
+        raise ValueError("An OpenAI API key is required for OpenAI mode.")
+
+    client = OpenAI(api_key=api_key)
+    source = f"""
+SESSION: {session_number}
+
+TUTON MATERIAL:
+{material[:45_000]}
+
+DISCUSSION QUESTIONS:
+{discussion[:8_000] or "Not provided"}
+
+ASSIGNMENTS:
+{assignments[:8_000] or "Not provided"}
+""".strip()
+
+    response = client.responses.parse(
+        model=model,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "You create accurate university exam-preparation material from the learner's "
+                    "own notes. Match the dominant language of the source. Return 4-6 concise summary "
+                    "points, 5-8 key terms, 3-4 exam-focus predictions, 5-6 flashcards, and 5 "
+                    "multiple-choice questions. Every quiz question needs 4 plausible options. Base "
+                    "all factual claims on the supplied source. Predictions are study priorities, not "
+                    "claims about leaked or guaranteed exam content. Use High confidence only when a "
+                    "concept is repeated in the material and reinforced by a discussion or assignment."
+                ),
+            },
+            {"role": "user", "content": source},
+        ],
+        text_format=StudyPack,
+        max_output_tokens=5_000,
+    )
+
+    if response.output_parsed is None:
+        raise RuntimeError("The AI response did not contain a usable study pack.")
+    return response.output_parsed
+
+
+# -----------------------------------------------------------------------------
+# Browser Text-to-Speech (previously tts.py)
+# -----------------------------------------------------------------------------
+
+
+def speech_controls(summary_text: str, language: str = "id-ID") -> str:
+    """Return a self-contained Web Speech API player."""
+
+    safe_text = json.dumps(summary_text, ensure_ascii=False).replace("</", "<\\/")
+    safe_language = json.dumps(language)
+    if not summary_text.strip():
+        return '<div class="empty">Generate a summary first, then press Listen.</div>'
+
+    return f"""
+    <div class="reader" role="group" aria-label="Summary audio reader">
+      <div class="reader-head">
+        <div><span class="eyebrow">AUDIO READER</span><strong>Listen to this summary</strong></div>
+        <select id="voice" aria-label="Choose a browser voice"></select>
+      </div>
+      <div class="controls">
+        <button id="play" type="button">▶ Listen</button>
+        <button id="pause" type="button">Ⅱ Pause / resume</button>
+        <button id="stop" type="button">■ Stop</button>
+      </div>
+      <p id="status" aria-live="polite">Uses the voices already available in your browser.</p>
+    </div>
+    <style>
+      * {{ box-sizing: border-box; }}
+      body {{ margin: 0; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #172336; }}
+      .reader {{ border: 1px solid #dfe4e2; border-radius: 16px; padding: 16px; background: #fffdf8; }}
+      .reader-head {{ display: flex; gap: 12px; justify-content: space-between; align-items: center; }}
+      .reader-head div {{ display: grid; gap: 3px; }}
+      .eyebrow {{ color: #d45c3b; font-size: 10px; font-weight: 800; letter-spacing: .14em; }}
+      strong {{ font-size: 16px; }}
+      select {{ max-width: 48%; border: 1px solid #ccd4d1; border-radius: 9px; padding: 8px; background: white; }}
+      .controls {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }}
+      button {{ border: 0; border-radius: 9px; padding: 9px 13px; font-weight: 750; cursor: pointer; }}
+      #play {{ color: white; background: #123d3a; }}
+      #pause, #stop {{ color: #123d3a; background: #e8efec; }}
+      p {{ margin: 10px 0 0; color: #65716f; font-size: 12px; }}
+    </style>
+    <script>
+      const text = {safe_text};
+      const language = {safe_language};
+      const synth = window.speechSynthesis;
+      const voiceSelect = document.getElementById('voice');
+      const status = document.getElementById('status');
+
+      function loadVoices() {{
+        const voices = synth.getVoices();
+        voiceSelect.innerHTML = '';
+        voices.forEach((voice, index) => {{
+          const option = document.createElement('option');
+          option.value = String(index);
+          option.textContent = `${{voice.name}} (${{voice.lang}})`;
+          if (voice.lang.toLowerCase().startsWith(language.slice(0, 2).toLowerCase())) option.selected = true;
+          voiceSelect.appendChild(option);
+        }});
+      }}
+
+      loadVoices();
+      if ('onvoiceschanged' in synth) synth.onvoiceschanged = loadVoices;
+      document.getElementById('play').addEventListener('click', () => {{
+        synth.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = language;
+        const selected = synth.getVoices()[Number(voiceSelect.value)];
+        if (selected) utterance.voice = selected;
+        utterance.rate = 0.96;
+        utterance.onstart = () => status.textContent = 'Reading the summary…';
+        utterance.onend = () => status.textContent = 'Finished. Replay whenever you are ready.';
+        utterance.onerror = () => status.textContent = 'This browser could not start speech. Try another voice.';
+        synth.speak(utterance);
+      }});
+      document.getElementById('pause').addEventListener('click', () => {{
+        if (synth.paused) {{ synth.resume(); status.textContent = 'Reading the summary…'; }}
+        else {{ synth.pause(); status.textContent = 'Paused.'; }}
+      }});
+      document.getElementById('stop').addEventListener('click', () => {{
+        synth.cancel();
+        status.textContent = 'Stopped.';
+      }});
+    </script>
+    """
 
 
 APP_CSS = """
@@ -104,6 +500,122 @@ APP_CSS = """
 DEMO_MATERIAL = """Learning outcomes describe what students should be able to explain, compare, and apply after a study unit. A useful learning outcome uses an observable verb and aligns with both learning activities and assessment. Formative assessment provides feedback during the learning process, while summative assessment evaluates achievement at the end of a unit. Constructive alignment connects learning outcomes, teaching activities, and assessment tasks. When these three elements are consistent, students can focus their effort on the intended knowledge and skills. Feedback is most effective when it is timely, specific, and gives the learner a clear next action. Rubrics make performance criteria visible and can improve self-assessment before an assignment is submitted."""
 DEMO_DISCUSSION = "How does constructive alignment improve learning? Compare formative and summative assessment."
 DEMO_ASSIGNMENT = "Create one measurable learning outcome and a short rubric that assesses it."
+
+
+# -----------------------------------------------------------------------------
+# Master Catalog — UT S1 Sistem Informasi, curriculum 2025/2026
+# 51 numbered curriculum slots, 145 SKS, arranged across eight semesters.
+# Choice slots preserve every alternative from the official catalog.
+# -----------------------------------------------------------------------------
+
+
+CURRICULUM_SOURCE_URL = (
+    "https://www.ut.ac.id/wp-content/uploads/2025/12/"
+    "01-Katalog-Kurikulum-FEB-FHISIP-FKIP-Non-PGSD-Non-PGPAUD-dan-Non-PAI-"
+    "FST-UT-2025-2026-10Desember2025.pdf"
+)
+
+COURSE_CATALOG: list[dict[str, Any]] = [
+    {"slot": 1, "semester": 1, "code": "STSI4101", "name": "Pengantar Sistem Informasi", "sks": 3},
+    {"slot": 2, "semester": 1, "code": "STSI4103", "name": "Sistem Operasi", "sks": 3},
+    {
+        "slot": 3,
+        "semester": 1,
+        "code": "MKWN4101/02/03/04/05/07",
+        "name": "Pendidikan Agama — pilih sesuai data pribadi",
+        "sks": 3,
+        "choices": [
+            "MKWN4101 — Pendidikan Agama Islam",
+            "MKWN4102 — Pendidikan Agama Katolik",
+            "MKWN4103 — Pendidikan Agama Kristen",
+            "MKWN4104 — Pendidikan Agama Buddha",
+            "MKWN4105 — Pendidikan Agama Hindu",
+            "MKWN4107 — Pendidikan Agama Konghucu",
+        ],
+    },
+    {"slot": 4, "semester": 1, "code": "STSI4102", "name": "Algoritma dan Pemrograman", "sks": 3},
+    {"slot": 5, "semester": 1, "code": "STMA4112", "name": "Matematika Dasar", "sks": 3},
+    {"slot": 6, "semester": 1, "code": "MKWN4109", "name": "Pendidikan Kewarganegaraan", "sks": 2},
+    {"slot": 7, "semester": 2, "code": "STSI4105", "name": "Basis Data", "sks": 3},
+    {"slot": 8, "semester": 2, "code": "STSI4104", "name": "Struktur Data", "sks": 3},
+    {"slot": 9, "semester": 2, "code": "MKKI4201", "name": "Pengantar Statistika", "sks": 3},
+    {"slot": 10, "semester": 2, "code": "MKDI4201", "name": "Bahasa Inggris", "sks": 3},
+    {"slot": 11, "semester": 2, "code": "MKWN4108", "name": "Bahasa Indonesia", "sks": 2},
+    {"slot": 12, "semester": 2, "code": "MKWN4110", "name": "Pancasila", "sks": 2},
+    {"slot": 13, "semester": 2, "code": "STMA4113", "name": "Aljabar Linear Elementer", "sks": 2},
+    {"slot": 14, "semester": 3, "code": "STIK4111", "name": "Dasar Pemrograman R", "sks": 3},
+    {"slot": 15, "semester": 3, "code": "STSI4106", "name": "Logika Informatika", "sks": 3},
+    {"slot": 16, "semester": 3, "code": "STSI4201", "name": "Pemrograman Berbasis Desktop", "sks": 3},
+    {"slot": 17, "semester": 3, "code": "STSI4203", "name": "Interaksi Manusia dan Komputer", "sks": 3},
+    {"slot": 18, "semester": 3, "code": "STSI4202", "name": "Rekayasa Perangkat Lunak", "sks": 3},
+    {"slot": 19, "semester": 3, "code": "STSI4205", "name": "Jaringan Komputer", "sks": 3},
+    {"slot": 20, "semester": 3, "code": "MKDI4202", "name": "Belajar di Era Digital", "sks": 3},
+    {"slot": 21, "semester": 4, "code": "MKDI4203", "name": "Kewirausahaan di Era Digital", "sks": 3},
+    {"slot": 22, "semester": 4, "code": "STSI4204", "name": "Analisis dan Visualisasi Data", "sks": 2},
+    {"slot": 23, "semester": 4, "code": "STSI4208", "name": "Analisis dan Perancangan Sistem", "sks": 3},
+    {"slot": 24, "semester": 4, "code": "STSI4209", "name": "Pemrograman Berbasis Web", "sks": 3},
+    {"slot": 25, "semester": 4, "code": "STSI4206", "name": "Proses Bisnis", "sks": 2},
+    {"slot": 26, "semester": 4, "code": "STSI4207", "name": "Sistem Informasi Manajemen", "sks": 3},
+    {"slot": 27, "semester": 4, "code": "EMBS4207", "name": "Perilaku Organisasi", "sks": 3},
+    {"slot": 28, "semester": 5, "code": "FSSI4101", "name": "Basic Reading", "sks": 3},
+    {"slot": 29, "semester": 5, "code": "STMA4111", "name": "Kalkulus Diferensial", "sks": 3},
+    {"slot": 30, "semester": 5, "code": "EMBS4102", "name": "Pengantar Bisnis", "sks": 3},
+    {
+        "slot": 31,
+        "semester": 5,
+        "code": "STSI4301 / STSI4302",
+        "name": "Mata kuliah pilihan I",
+        "sks": 3,
+        "choices": [
+            "STSI4301 — Sistem Pendukung Keputusan",
+            "STSI4302 — Administrasi Server",
+        ],
+    },
+    {"slot": 32, "semester": 5, "code": "FSAP4102", "name": "Teori Organisasi", "sks": 3},
+    {"slot": 33, "semester": 5, "code": "STSI4303", "name": "Pemrograman Berbasis Perangkat Bergerak", "sks": 3},
+    {"slot": 34, "semester": 5, "code": "STSI4308", "name": "Komunikasi Bisnis dan Teknis", "sks": 2},
+    {
+        "slot": 35,
+        "semester": 6,
+        "code": "STSI4307 / STSI4309",
+        "name": "Mata kuliah pilihan II",
+        "sks": 3,
+        "choices": ["STSI4307 — Data Mining", "STSI4309 — Administrasi Jaringan"],
+    },
+    {"slot": 36, "semester": 6, "code": "STSI4306", "name": "Arsitektur dan Perancangan Sistem Enterprise", "sks": 3},
+    {"slot": 37, "semester": 6, "code": "STSI4305", "name": "Etika Profesi", "sks": 2},
+    {
+        "slot": 38,
+        "semester": 6,
+        "code": "STPL4211 / MKKI4301",
+        "name": "Mata kuliah pilihan III",
+        "sks": 3,
+        "choices": [
+            "STPL4211 — Sistem Informasi Perencanaan",
+            "MKKI4301 — Pemberdayaan Masyarakat",
+        ],
+    },
+    {"slot": 39, "semester": 6, "code": "STSI4304", "name": "Dasar Infrastruktur TI", "sks": 2},
+    {"slot": 40, "semester": 6, "code": "STSI4310", "name": "Metodologi Penelitian", "sks": 3},
+    {"slot": 41, "semester": 6, "code": "EMBS4101", "name": "Manajemen", "sks": 4},
+    {
+        "slot": 42,
+        "semester": 7,
+        "code": "STSI4409 / STSI4404",
+        "name": "Mata kuliah pilihan IV",
+        "sks": 3,
+        "choices": ["STSI4409 — Data Warehouse", "STSI4404 — Keamanan Jaringan"],
+    },
+    {"slot": 43, "semester": 7, "code": "STDA4101", "name": "Pengantar Sains Data", "sks": 3},
+    {"slot": 44, "semester": 7, "code": "STSI4403", "name": "Manajemen Risiko dan Audit Sistem Informasi", "sks": 3},
+    {"slot": 45, "semester": 7, "code": "STSI4402", "name": "Tata Kelola Teknologi Informasi", "sks": 2},
+    {"slot": 46, "semester": 7, "code": "STSI4440", "name": "Capstone Project", "sks": 6},
+    {"slot": 47, "semester": 8, "code": "STSI4406", "name": "Manajemen Proyek Sistem Informasi", "sks": 2},
+    {"slot": 48, "semester": 8, "code": "STSI4405", "name": "Keamanan Sistem Informasi", "sks": 2},
+    {"slot": 49, "semester": 8, "code": "STSI4407", "name": "Manajemen Layanan Teknologi Informasi", "sks": 3},
+    {"slot": 50, "semester": 8, "code": "STSI4408", "name": "E-Bisnis", "sks": 3},
+    {"slot": 51, "semester": 8, "code": "EACC4207", "name": "Sistem Informasi Akuntansi", "sks": 3},
+]
 
 
 def default_session() -> dict[str, Any]:
@@ -328,12 +840,122 @@ def render_quiz(pack: StudyPack, session_id: str) -> None:
             st.write(question.explanation)
 
 
+def validate_course_catalog() -> None:
+    """Fail fast if the embedded curriculum is edited inconsistently."""
+
+    expected_semester_sks = {1: 17, 2: 18, 3: 21, 4: 19, 5: 20, 6: 20, 7: 17, 8: 13}
+    actual_semester_sks = {
+        semester: sum(item["sks"] for item in COURSE_CATALOG if item["semester"] == semester)
+        for semester in range(1, 9)
+    }
+    if len(COURSE_CATALOG) != 51:
+        raise ValueError("COURSE_CATALOG must contain exactly 51 numbered curriculum slots.")
+    if [item["slot"] for item in COURSE_CATALOG] != list(range(1, 52)):
+        raise ValueError("COURSE_CATALOG slots must run consecutively from 1 through 51.")
+    if sum(item["sks"] for item in COURSE_CATALOG) != 145:
+        raise ValueError("COURSE_CATALOG must total 145 SKS.")
+    if actual_semester_sks != expected_semester_sks:
+        raise ValueError("COURSE_CATALOG semester totals do not match the official curriculum.")
+
+
+def render_course_catalog() -> None:
+    """Render the embedded 51-slot UT Information Systems curriculum."""
+
+    st.markdown('<div class="hero-kicker">OFFICIAL CURRICULUM · 2025/2026</div>', unsafe_allow_html=True)
+    st.title("Master Catalog: S1 Sistem Informasi")
+    st.markdown(
+        '<p class="hero-copy">Explore all 51 numbered curriculum slots in UT’s current Information Systems program. Choice groups preserve every official alternative while counting once toward the 145-SKS degree total.</p>',
+        unsafe_allow_html=True,
+    )
+
+    metric_one, metric_two, metric_three = st.columns(3)
+    metric_one.metric("Curriculum slots", 51)
+    metric_two.metric("Total credits", "145 SKS")
+    metric_three.metric("Study plan", "8 semesters")
+
+    filter_one, filter_two = st.columns([1.35, 1])
+    with filter_one:
+        query = st.text_input(
+            "Search catalog",
+            placeholder="Search by code or course name…",
+            key="catalog_search",
+        ).strip().casefold()
+    with filter_two:
+        semester_filter = st.selectbox(
+            "Semester",
+            options=[0, *range(1, 9)],
+            format_func=lambda value: "All semesters" if value == 0 else f"Semester {value}",
+            key="catalog_semester",
+        )
+
+    filtered = []
+    for item in COURSE_CATALOG:
+        choice_text = " ".join(item.get("choices", []))
+        searchable = f"{item['code']} {item['name']} {choice_text}".casefold()
+        if query and query not in searchable:
+            continue
+        if semester_filter and item["semester"] != semester_filter:
+            continue
+        filtered.append(item)
+
+    st.caption(f"Showing {len(filtered)} of {len(COURSE_CATALOG)} curriculum slots")
+    rows = [
+        {
+            "No.": item["slot"],
+            "Semester": item["semester"],
+            "Code": item["code"],
+            "Course": item["name"],
+            "SKS": item["sks"],
+            "Type": "Choose one" if item.get("choices") else "Required",
+        }
+        for item in filtered
+    ]
+    st.dataframe(
+        rows,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "No.": st.column_config.NumberColumn(width="small"),
+            "Semester": st.column_config.NumberColumn(width="small"),
+            "SKS": st.column_config.NumberColumn(width="small"),
+        },
+    )
+
+    choice_items = [item for item in filtered if item.get("choices")]
+    if choice_items:
+        st.markdown("### Choice details")
+        for item in choice_items:
+            with st.expander(f"Slot {item['slot']} · {item['name']}"):
+                for choice in item["choices"]:
+                    st.markdown(f"- {choice}")
+
+    st.info(
+        "Catalog note: the official table numbers choice groups as single curriculum slots. "
+        "Select one alternative in each applicable slot. Always confirm registration rules in MyUT."
+    )
+    st.link_button("Open the official UT curriculum PDF", CURRICULUM_SOURCE_URL)
+
+
+validate_course_catalog()
+
+
 init_state()
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("## UT Study Prep")
     st.caption("Your 8-session final-exam workspace")
+    workspace = st.radio(
+        "Workspace",
+        options=["Study desk", "Course catalog"],
+        horizontal=True,
+    )
+
+if workspace == "Course catalog":
+    render_course_catalog()
+    st.stop()
+
+with st.sidebar:
     selected_number = st.selectbox(
         "Study session",
         options=list(range(1, 9)),
@@ -372,7 +994,7 @@ with st.sidebar:
 
     st.divider()
     upload = st.file_uploader("Restore a study backup", type=["json"])
-    if upload is not None and st.button("Restore all sessions", use_container_width=True):
+    if upload is not None and st.button("Restore all sessions", width="stretch"):
         try:
             restore_backup(upload.getvalue())
             st.success("Backup restored.")
@@ -447,18 +1069,18 @@ session_data = st.session_state.study_sessions[session_id]
 
 button_one, button_two, button_three, button_space = st.columns([1.3, 1, 1, 2])
 with button_one:
-    generate = st.button("Generate study pack", type="primary", use_container_width=True)
+    generate = st.button("Generate study pack", type="primary", width="stretch")
 with button_two:
     st.button(
         "Load demo",
-        use_container_width=True,
+        width="stretch",
         on_click=load_demo,
         args=(session_id,),
     )
 with button_three:
     st.button(
         "Clear session",
-        use_container_width=True,
+        width="stretch",
         on_click=clear_session,
         args=(session_id,),
     )
@@ -533,7 +1155,7 @@ if session_data.get("pack"):
             data=pack_markdown(session_id, session_data),
             file_name=f"ut-study-prep-session-{session_id}.md",
             mime="text/markdown",
-            use_container_width=True,
+            width="stretch",
         )
     with download_two:
         st.download_button(
@@ -541,7 +1163,7 @@ if session_data.get("pack"):
             data=backup_json(),
             file_name="ut-study-prep-backup.json",
             mime="application/json",
-            use_container_width=True,
+            width="stretch",
         )
 else:
     st.info("Your generated summary, exam focus, flashcards, quiz, and audio controls will appear here.")
