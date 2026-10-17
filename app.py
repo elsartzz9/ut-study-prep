@@ -6,14 +6,18 @@ import json
 import math
 import os
 import re
+import smtplib
 import sqlite3
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -24,6 +28,16 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+st.session_state.setdefault("bahasa_antarmuka", "Bahasa Indonesia")
+
+
+def memakai_bahasa_inggris() -> bool:
+    return st.session_state.get("bahasa_antarmuka") == "English"
+
+
+def tx(indonesia: str, english: str) -> str:
+    return english if memakai_bahasa_inggris() else indonesia
 
 
 # -----------------------------------------------------------------------------
@@ -293,7 +307,7 @@ def daftar_semester() -> list[dict[str, Any]]:
 def buat_semester(nama: str) -> int:
     nama_bersih = re.sub(r"\s+", " ", nama.strip())
     if not nama_bersih:
-        raise ValueError("Tuliskan nama semester terlebih dahulu.")
+        raise ValueError(tx("Tuliskan nama semester terlebih dahulu.", "Enter a semester name first."))
     with buka_db() as koneksi:
         try:
             kursor = koneksi.execute(
@@ -301,7 +315,7 @@ def buat_semester(nama: str) -> int:
                 (nama_bersih, waktu_sekarang()),
             )
         except sqlite3.IntegrityError as exc:
-            raise ValueError("Nama semester tersebut sudah tersedia.") from exc
+            raise ValueError(tx("Nama semester tersebut sudah tersedia.", "That semester already exists.")) from exc
     return int(kursor.lastrowid)
 
 
@@ -360,9 +374,9 @@ def tambah_mata_kuliah_khusus(
     kode_bersih = re.sub(r"[^A-Z0-9_-]", "", kode.upper().strip())
     nama_bersih = re.sub(r"\s+", " ", nama.strip())
     if not kode_bersih or not nama_bersih:
-        raise ValueError("Kode dan nama mata kuliah wajib diisi.")
+        raise ValueError(tx("Kode dan nama mata kuliah wajib diisi.", "Course code and name are required."))
     if kode_bersih in PENAWARAN_PER_KODE:
-        raise ValueError("Kode tersebut sudah ada di katalog. Pilih dari daftar katalog.")
+        raise ValueError(tx("Kode tersebut sudah ada di katalog. Pilih dari daftar katalog.", "That code is already in the catalog. Select it from the catalog list."))
     with buka_db() as koneksi:
         koneksi.execute(
             """
@@ -538,7 +552,11 @@ def paket_belajar_lokal(
     gabungan = "\n".join(item for item in (materi, diskusi, tugas) if item.strip())
     kalimat = pecah_kalimat(gabungan) or [gabungan.strip()]
     kata_kunci = ambil_kata_kunci(gabungan, 14)
-    cadangan = ["konsep", "penerapan", "analisis", "proses", "evaluasi", "sistem", "data", "kualitas"]
+    cadangan = (
+        ["concept", "application", "analysis", "process", "evaluation", "system", "data", "quality"]
+        if memakai_bahasa_inggris()
+        else ["konsep", "penerapan", "analisis", "proses", "evaluasi", "sistem", "data", "kualitas"]
+    )
     for kata in cadangan:
         if len(kata_kunci) >= 8:
             break
@@ -562,7 +580,10 @@ def paket_belajar_lokal(
     poin_penting = kalimat_ringkasan[:6]
     if len(poin_penting) < 5:
         poin_penting.extend(
-            f"Hubungkan konsep {kata.title()} dengan capaian belajar {mata_kuliah['name']}."
+            tx(
+                f"Hubungkan konsep {kata.title()} dengan capaian belajar {mata_kuliah['name']}.",
+                f"Connect {kata.title()} to the learning outcomes for {mata_kuliah['name']}.",
+            )
             for kata in kata_kunci[: 5 - len(poin_penting)]
         )
 
@@ -571,11 +592,17 @@ def paket_belajar_lokal(
     prediksi = [
         {
             "topic": topik.title(),
-            "priority": "Tinggi" if indeks < 2 else "Sedang",
+            "priority": tx("Tinggi", "High") if indeks < 2 else tx("Sedang", "Medium"),
             "rationale": (
-                "Topik muncul pada diskusi atau tugas; latih penjelasan dan penerapannya."
+                tx(
+                    "Topik muncul pada diskusi atau tugas; latih penjelasan dan penerapannya.",
+                    "This topic appears in the discussion or assignment; practice explaining and applying it.",
+                )
                 if topik in topik_diskusi
-                else "Topik menonjol pada materi Tuton dan layak dijadikan fokus belajar konsep."
+                else tx(
+                    "Topik menonjol pada materi Tuton dan layak dijadikan fokus belajar konsep.",
+                    "This topic is prominent in the tutorial material and deserves focused review.",
+                )
             ),
         }
         for indeks, topik in enumerate(topik_prediksi)
@@ -585,10 +612,19 @@ def paket_belajar_lokal(
     for topik in kata_kunci[:6]:
         jawaban = next(
             (item for item in kalimat if topik.lower() in item.lower()),
-            f"Pelajari hubungan {topik} dengan materi {mata_kuliah['name']}.",
+            tx(
+                f"Pelajari hubungan {topik} dengan materi {mata_kuliah['name']}.",
+                f"Review how {topik} relates to {mata_kuliah['name']}.",
+            ),
         )
         flashcard.append(
-            {"front": f"Apa yang perlu diingat tentang {topik.title()}?", "back": jawaban}
+            {
+                "front": tx(
+                    f"Apa yang perlu diingat tentang {topik.title()}?",
+                    f"What should you remember about {topik.title()}?",
+                ),
+                "back": jawaban,
+            }
         )
 
     kuis = []
@@ -599,16 +635,24 @@ def paket_belajar_lokal(
         )
         pengecoh = [kata.title() for kata in kata_kunci if kata != topik][:3]
         while len(pengecoh) < 3:
-            pengecoh.append(["Penerapan", "Evaluasi", "Arsitektur"][len(pengecoh)])
+            pengecoh.append(
+                (["Application", "Evaluation", "Architecture"] if memakai_bahasa_inggris() else ["Penerapan", "Evaluasi", "Arsitektur"])[len(pengecoh)]
+            )
         indeks_jawaban = indeks % 4
         opsi = pengecoh[:]
         opsi.insert(indeks_jawaban, topik.title())
         kuis.append(
             {
-                "question": f"Konsep mana yang paling sesuai dengan catatan berikut: “{sumber[:150]}”?",
+                "question": tx(
+                    f"Konsep mana yang paling sesuai dengan catatan berikut: “{sumber[:150]}”?",
+                    f"Which concept best matches this note: “{sumber[:150]}”?",
+                ),
                 "options": opsi,
                 "answer_index": indeks_jawaban,
-                "explanation": f"Catatan tersebut paling langsung membahas {topik.title()}.",
+                "explanation": tx(
+                    f"Catatan tersebut paling langsung membahas {topik.title()}.",
+                    f"The note most directly discusses {topik.title()}.",
+                ),
             }
         )
 
@@ -618,20 +662,29 @@ def paket_belajar_lokal(
         "exam_predictions": prediksi,
         "flashcards": flashcard,
         "quiz": kuis,
-        "study_plan": [
-            "Baca ringkasan sekali tanpa memberi tanda.",
-            "Sebutkan kembali setiap poin penting tanpa melihat catatan.",
-            "Latih topik kisi-kisi UAS dengan contoh buatan sendiri.",
-            "Kerjakan kuis, lalu ulangi konsep yang masih keliru.",
-        ],
+        "study_plan": (
+            [
+                "Read the summary once without highlighting.",
+                "Recall every key point without looking at your notes.",
+                "Practice the exam-focus topics with your own examples.",
+                "Complete the quiz, then revisit every missed concept.",
+            ]
+            if memakai_bahasa_inggris()
+            else [
+                "Baca ringkasan sekali tanpa memberi tanda.",
+                "Sebutkan kembali setiap poin penting tanpa melihat catatan.",
+                "Latih topik kisi-kisi UAS dengan contoh buatan sendiri.",
+                "Kerjakan kuis, lalu ulangi konsep yang masih keliru.",
+            ]
+        ),
     }
 
 
 def buat_prompt(
     mata_kuliah: dict[str, Any], nomor_sesi: int, materi: str, diskusi: str, tugas: str
 ) -> str:
-    sumber = f"""
-MATA KULIAH: {mata_kuliah['code']} — {mata_kuliah['name']} ({mata_kuliah['credits']} SKS)
+    sumber = tx(
+        f"""MATA KULIAH: {mata_kuliah['code']} — {mata_kuliah['name']} ({mata_kuliah['credits']} SKS)
 SESI TUTON: {nomor_sesi}
 
 MATERI ATAU RINGKASAN TUTON:
@@ -641,8 +694,43 @@ DISKUSI:
 {diskusi or '(tidak diisi)'}
 
 TUGAS:
-{tugas or '(tidak diisi)'}
-""".strip()[:30000]
+{tugas or '(tidak diisi)'}""",
+        f"""COURSE: {mata_kuliah['code']} — {mata_kuliah['name']} ({mata_kuliah['credits']} credits)
+TUTORIAL SESSION: {nomor_sesi}
+
+TUTORIAL MATERIAL OR NOTES:
+{materi}
+
+DISCUSSION:
+{diskusi or '(not provided)'}
+
+ASSIGNMENT:
+{tugas or '(not provided)'}""",
+    ).strip()[:30000]
+    if memakai_bahasa_inggris():
+        return f"""
+You are a study assistant for a Universitas Terbuka Information Systems student.
+Use only the supplied material and write in clear English. Never claim that a predicted topic is
+guaranteed to appear on the final exam. Return only one valid JSON object with this structure:
+
+{{
+  "summary": "a concise and complete summary",
+  "key_points": ["5 to 7 important points"],
+  "exam_predictions": [
+    {{"topic": "topic", "priority": "High or Medium", "rationale": "evidence-based reason"}}
+  ],
+  "flashcards": [{{"front": "question", "back": "answer"}}],
+  "quiz": [
+    {{"question": "multiple-choice question", "options": ["A", "B", "C", "D"],
+      "answer_index": 0, "explanation": "why the answer is correct"}}
+  ],
+  "study_plan": ["four short study actions"]
+}}
+
+Create 5 exam-focus predictions, 6 flashcards, and 5 quiz questions. answer_index is zero-based.
+
+{sumber}
+""".strip()
     return f"""
 Anda adalah pendamping belajar mahasiswa Sistem Informasi Universitas Terbuka.
 Gunakan hanya bahan yang diberikan. Gunakan bahasa Indonesia yang jelas. Jangan pernah menyatakan
@@ -686,9 +774,9 @@ def kirim_json(
             pesan = rincian.get("error", {}).get("message") or str(rincian)
         except (json.JSONDecodeError, UnicodeDecodeError):
             pesan = f"HTTP {exc.code}"
-        raise KesalahanPenyedia(f"Permintaan ke layanan AI gagal: {pesan}") from exc
+        raise KesalahanPenyedia(tx(f"Permintaan ke layanan AI gagal: {pesan}", f"The AI provider request failed: {pesan}")) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise KesalahanPenyedia(f"Layanan AI tidak dapat dihubungi: {exc}") from exc
+        raise KesalahanPenyedia(tx(f"Layanan AI tidak dapat dihubungi: {exc}", f"The AI provider could not be reached: {exc}")) from exc
 
 
 def ambil_json(teks: str) -> dict[str, Any]:
@@ -697,13 +785,13 @@ def ambil_json(teks: str) -> dict[str, Any]:
         hasil = re.sub(r"^```(?:json)?\s*|\s*```$", "", hasil, flags=re.IGNORECASE)
     awal, akhir = hasil.find("{"), hasil.rfind("}")
     if awal < 0 or akhir <= awal:
-        raise KesalahanPenyedia("Layanan AI tidak mengirimkan paket belajar berbentuk JSON.")
+        raise KesalahanPenyedia(tx("Layanan AI tidak mengirimkan paket belajar berbentuk JSON.", "The AI provider did not return a JSON study pack."))
     try:
         data = json.loads(hasil[awal : akhir + 1])
     except json.JSONDecodeError as exc:
-        raise KesalahanPenyedia("Format jawaban layanan AI tidak valid. Silakan coba lagi.") from exc
+        raise KesalahanPenyedia(tx("Format jawaban layanan AI tidak valid. Silakan coba lagi.", "The AI provider returned invalid JSON. Please try again.")) from exc
     if not isinstance(data, dict):
-        raise KesalahanPenyedia("Jawaban layanan AI bukan paket belajar yang valid.")
+        raise KesalahanPenyedia(tx("Jawaban layanan AI bukan paket belajar yang valid.", "The AI response is not a valid study pack."))
     return rapikan_paket(data)
 
 
@@ -747,7 +835,7 @@ def rapikan_paket(paket: dict[str, Any]) -> dict[str, Any]:
             )
     rencana = [str(item).strip() for item in paket.get("study_plan", []) if str(item).strip()]
     if not ringkasan or len(poin) < 3 or len(prediksi) < 2 or len(flashcard) < 3 or len(kuis) < 3:
-        raise KesalahanPenyedia("Jawaban layanan AI belum lengkap. Silakan buat ulang paket belajar.")
+        raise KesalahanPenyedia(tx("Jawaban layanan AI belum lengkap. Silakan buat ulang paket belajar.", "The AI response is incomplete. Please generate the study pack again."))
     return {
         "summary": ringkasan,
         "key_points": poin[:8],
@@ -772,7 +860,7 @@ def paket_gemini(prompt: str, kunci_api: str, model: str) -> dict[str, Any]:
         bagian = data["candidates"][0]["content"]["parts"]
         teks = "".join(item.get("text", "") for item in bagian)
     except (KeyError, IndexError, TypeError) as exc:
-        raise KesalahanPenyedia("Gemini tidak mengirimkan jawaban yang dapat dibaca.") from exc
+        raise KesalahanPenyedia(tx("Gemini tidak mengirimkan jawaban yang dapat dibaca.", "Gemini did not return readable output.")) from exc
     return ambil_json(teks)
 
 
@@ -793,7 +881,7 @@ def paket_groq(prompt: str, kunci_api: str, model: str) -> dict[str, Any]:
     try:
         teks = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise KesalahanPenyedia("Groq tidak mengirimkan jawaban yang dapat dibaca.") from exc
+        raise KesalahanPenyedia(tx("Groq tidak mengirimkan jawaban yang dapat dibaca.", "Groq did not return readable output.")) from exc
     return ambil_json(teks)
 
 
@@ -810,18 +898,226 @@ def buat_paket_belajar(
     if penyedia == "Lokal (tanpa API)":
         return paket_belajar_lokal(mata_kuliah, materi, diskusi, tugas)
     if not kunci_api.strip():
-        raise KesalahanPenyedia(f"Masukkan kunci API {penyedia} di bilah samping.")
+        raise KesalahanPenyedia(tx(f"Masukkan kunci API {penyedia} di bilah samping.", f"Enter your {penyedia} API key in the sidebar."))
     prompt = buat_prompt(mata_kuliah, nomor_sesi, materi, diskusi, tugas)
     if penyedia == "Google Gemini":
         return paket_gemini(prompt, kunci_api.strip(), model)
     if penyedia == "Groq":
         return paket_groq(prompt, kunci_api.strip(), model)
-    raise KesalahanPenyedia("Mesin belajar tidak dikenali.")
+    raise KesalahanPenyedia(tx("Mesin belajar tidak dikenali.", "The study engine is not supported."))
 
 
 # -----------------------------------------------------------------------------
 # Tampilan dan komponen
 # -----------------------------------------------------------------------------
+
+NAMA_MK_INGGRIS = {
+    "STSI4101": "Introduction to Information Systems", "STSI4103": "Operating Systems",
+    "MKWN4101": "Islamic Religious Education", "MKWN4102": "Catholic Religious Education",
+    "MKWN4103": "Christian Religious Education", "MKWN4104": "Buddhist Religious Education",
+    "MKWN4105": "Hindu Religious Education", "MKWN4107": "Confucian Religious Education",
+    "STSI4102": "Algorithms and Programming", "STMA4112": "Basic Mathematics",
+    "MKWN4109": "Civic Education", "STSI4105": "Databases", "STSI4104": "Data Structures",
+    "MKKI4201": "Introduction to Statistics", "MKDI4201": "English",
+    "MKWN4108": "Indonesian Language", "MKWN4110": "Pancasila",
+    "STMA4113": "Elementary Linear Algebra", "STIK4111": "Fundamentals of R Programming",
+    "STSI4106": "Informatics Logic", "STSI4201": "Desktop-Based Programming",
+    "STSI4203": "Human-Computer Interaction", "STSI4202": "Software Engineering",
+    "STSI4205": "Computer Networks", "MKDI4202": "Learning in the Digital Era",
+    "MKDI4203": "Entrepreneurship in the Digital Era", "STSI4204": "Data Analysis and Visualization",
+    "STSI4208": "Systems Analysis and Design", "STSI4209": "Web-Based Programming",
+    "STSI4206": "Business Processes", "STSI4207": "Management Information Systems",
+    "EMBS4207": "Organizational Behavior", "FSSI4101": "Basic Reading",
+    "STMA4111": "Differential Calculus", "EMBS4102": "Introduction to Business",
+    "STSI4301": "Decision Support Systems", "STSI4302": "Server Administration",
+    "FSAP4102": "Organizational Theory", "STSI4303": "Mobile-Based Programming",
+    "STSI4308": "Business and Technical Communication", "STSI4307": "Data Mining",
+    "STSI4309": "Network Administration", "STSI4306": "Enterprise System Architecture and Design",
+    "STSI4305": "Professional Ethics", "STPL4211": "Planning Information Systems",
+    "MKKI4301": "Community Empowerment", "STSI4304": "Fundamentals of IT Infrastructure",
+    "STSI4310": "Research Methodology", "EMBS4101": "Management",
+    "STSI4409": "Data Warehouse", "STSI4404": "Network Security",
+    "STDA4101": "Introduction to Data Science", "STSI4403": "Risk Management and Information Systems Audit",
+    "STSI4402": "Information Technology Governance", "STSI4440": "Capstone Project (TAPS)",
+    "STSI4406": "Information Systems Project Management", "STSI4405": "Information Systems Security",
+    "STSI4407": "Information Technology Service Management", "STSI4408": "E-Business",
+    "EACC4207": "Accounting Information Systems",
+}
+
+NAMA_SLOT_INGGRIS = {
+    3: "Religious Education (choose one)",
+    31: "Elective course 1",
+    35: "Elective course 2",
+    38: "Elective course 3",
+    42: "Elective course 4",
+}
+
+KUTIPAN_HARIAN = [
+    (
+        "Mimpi kuliah atau bekerja di luar negeri tidak akan mengejar Anda. Selesaikan satu sesi hari ini, lalu biarkan konsistensi membuka jalan.",
+        "Your dream of studying or working abroad will not chase you. Finish one session today and let consistency open the door.",
+    ),
+    (
+        "Tidak punya banyak privilese berarti disiplin Anda harus menjadi modal. Sulit bukan berarti mustahil.",
+        "Having less privilege means discipline must become your capital. Difficult does not mean impossible.",
+    ),
+    (
+        "Takdir jarang berubah lewat niat besar. Ia berubah lewat kebiasaan kecil yang diulang ketika Anda sedang malas.",
+        "Destiny rarely changes through grand intentions. It changes through small habits repeated when you feel lazy.",
+    ),
+    (
+        "Orang lain mungkin memulai lebih jauh di depan. Tugas Anda bukan iri—tugas Anda terus memperpendek jarak.",
+        "Others may start far ahead. Your job is not to envy them; your job is to keep closing the distance.",
+    ),
+    (
+        "Lelah itu manusiawi. Menyerahkan masa depan kepada rasa malas adalah pilihan yang terlalu mahal.",
+        "Being tired is human. Handing your future to laziness is far too expensive.",
+    ),
+    (
+        "Tidak ada penyelamat yang akan datang membawa gelar, karier, atau visa impian Anda. Mulailah dari catatan di depan Anda.",
+        "No rescuer is coming with your degree, career, or dream visa. Start with the notes in front of you.",
+    ),
+    (
+        "Satu jam belajar mungkin terasa kecil, tetapi satu jam setiap hari bisa mengubah arah hidup Anda.",
+        "One hour of study may feel small, but one hour every day can change the direction of your life.",
+    ),
+    (
+        "Anda tidak harus merasa termotivasi untuk bergerak. Bergeraklah dulu; motivasi sering menyusul setelahnya.",
+        "You do not have to feel motivated before moving. Move first; motivation often follows.",
+    ),
+    (
+        "Kesempatan ke luar negeri dibangun jauh sebelum tiket dibeli—melalui kemampuan yang Anda latih hari ini.",
+        "An opportunity abroad is built long before the ticket is purchased—through the skills you practice today.",
+    ),
+    (
+        "Kemajuan yang sunyi tetaplah kemajuan. Tidak semua kerja keras perlu terlihat untuk mengubah hidup.",
+        "Quiet progress is still progress. Hard work does not need an audience to change your life.",
+    ),
+    (
+        "Jika hidup tidak memberi Anda jalan pintas, bangun stamina untuk menempuh jalan panjang.",
+        "If life gives you no shortcut, build the stamina to take the long road.",
+    ),
+    (
+        "Versi masa depan Anda membutuhkan bukti, bukan janji. Berikan satu sesi belajar sebagai bukti hari ini.",
+        "Your future self needs evidence, not promises. Give them one completed study session today.",
+    ),
+]
+
+
+def nama_tampilan(kode: str, nama_asli: str) -> str:
+    if memakai_bahasa_inggris():
+        return NAMA_MK_INGGRIS.get(kode, nama_asli)
+    return nama_asli
+
+
+def nama_slot_katalog(item: dict[str, Any]) -> str:
+    if memakai_bahasa_inggris():
+        return NAMA_SLOT_INGGRIS.get(
+            int(item["slot"]), NAMA_MK_INGGRIS.get(item["kode"], item["nama"])
+        )
+    return item["nama"]
+
+
+def waktu_lokal() -> datetime:
+    try:
+        return datetime.now(ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Bangkok")))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def kirim_email_belajar(
+    penerima: str,
+    jadwal: str,
+    mata_kuliah: dict[str, Any],
+    nomor_sesi: int,
+    paket: dict[str, Any],
+    host: str,
+    port: int,
+    pengguna: str,
+    kata_sandi: str,
+    pengirim: str,
+) -> None:
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", penerima.strip()):
+        raise ValueError(tx("Alamat email belum valid.", "Please enter a valid email address."))
+    if not host.strip() or not pengguna.strip() or not kata_sandi:
+        raise ValueError(
+            tx(
+                "Lengkapi host, nama pengguna, dan kata sandi SMTP di bilah samping.",
+                "Complete the SMTP host, username, and password in the sidebar.",
+            )
+        )
+
+    pesan = EmailMessage()
+    pesan["Subject"] = tx(
+        f"Ringkasan belajar UT · {mata_kuliah['code']} · Sesi {nomor_sesi}",
+        f"UT study summary · {mata_kuliah['code']} · Session {nomor_sesi}",
+    )
+    pesan["From"] = pengirim.strip() or pengguna.strip()
+    pesan["To"] = penerima.strip()
+    poin = "\n".join(f"- {item}" for item in paket.get("key_points", []))
+    fokus = "\n".join(
+        f"- {item['topic']} ({item['priority']}): {item['rationale']}"
+        for item in paket.get("exam_predictions", [])
+    )
+    pesan.set_content(
+        tx(
+            f"""Halo, Elsa!
+
+Berikut ringkasan belajar hari ini.
+
+Mata kuliah: {mata_kuliah['code']} — {nama_tampilan(mata_kuliah['code'], mata_kuliah['name'])}
+Sesi Tuton: {nomor_sesi}
+
+RINGKASAN
+{paket['summary']}
+
+POIN PENTING
+{poin}
+
+KISI-KISI UAS
+{fokus}
+
+JADWAL BELAJAR
+{jadwal or 'Belum ditentukan'}
+
+Tetap konsisten. Satu sesi hari ini tetap membawa Anda lebih dekat pada tujuan.
+""",
+            f"""Hello, Elsa!
+
+Here is today's learning summary.
+
+Course: {mata_kuliah['code']} — {nama_tampilan(mata_kuliah['code'], mata_kuliah['name'])}
+Tutorial session: {nomor_sesi}
+
+SUMMARY
+{paket['summary']}
+
+KEY POINTS
+{poin}
+
+FINAL-EXAM FOCUS
+{fokus}
+
+STUDY SCHEDULE
+{jadwal or 'Not set'}
+
+Stay consistent. One session today still moves you closer to your goal.
+""",
+        )
+    )
+
+    konteks = ssl.create_default_context()
+    if int(port) == 465:
+        with smtplib.SMTP_SSL(host.strip(), int(port), context=konteks, timeout=30) as server:
+            server.login(pengguna.strip(), kata_sandi)
+            server.send_message(pesan)
+    else:
+        with smtplib.SMTP(host.strip(), int(port), timeout=30) as server:
+            server.ehlo()
+            server.starttls(context=konteks)
+            server.ehlo()
+            server.login(pengguna.strip(), kata_sandi)
+            server.send_message(pesan)
 
 CSS_APLIKASI = """
 <style>
@@ -987,6 +1283,45 @@ CSS_APLIKASI = """
 
     .teks-bantu { font-size: .9rem; line-height: 1.55; opacity: .86; }
 
+    [data-testid="stExpander"] details {
+        background: var(--sand) !important;
+        border: 1px solid var(--demitasse) !important;
+        border-radius: 14px !important;
+        overflow: hidden;
+    }
+
+    [data-testid="stExpander"] summary {
+        background: var(--demitasse) !important;
+    }
+
+    [data-testid="stExpander"] summary,
+    [data-testid="stExpander"] summary p,
+    [data-testid="stExpander"] summary span,
+    [data-testid="stExpander"] summary svg {
+        color: var(--coconut) !important;
+        fill: var(--coconut) !important;
+        font-weight: 750 !important;
+    }
+
+    [data-testid="stExpanderDetails"],
+    [data-testid="stExpanderDetails"] p,
+    [data-testid="stExpanderDetails"] span,
+    [data-testid="stExpanderDetails"] label {
+        background: var(--sand) !important;
+        color: var(--demitasse) !important;
+    }
+
+    .sapaan-harian {
+        background: var(--sand); border: 1px solid var(--line); border-radius: 18px;
+        padding: 1.15rem 1.3rem; margin: 0 0 1.2rem;
+    }
+    .sapaan-harian strong { font-size: 1.1rem; color: var(--demitasse); }
+    .kutipan-harian { margin-top: .55rem; line-height: 1.6; font-style: italic; }
+    .petunjuk-ringkas {
+        background: var(--coconut); border: 1px dashed var(--demitasse); border-radius: 12px;
+        padding: .72rem .9rem; margin: .45rem 0 .85rem; color: var(--demitasse);
+    }
+
     @media (max-width: 700px) {
         .hero-ut { padding: 1.15rem; border-radius: 16px; }
         .hero-ut h1 { font-size: 2rem; }
@@ -1021,13 +1356,28 @@ def baca_paket(data_sesi: dict[str, Any]) -> dict[str, Any] | None:
 
 def isi_contoh(mata_kuliah_id: int, nomor_sesi: int) -> None:
     akhiran = f"{mata_kuliah_id}_{nomor_sesi}"
-    st.session_state[f"materi_{akhiran}"] = CONTOH_MATERI
-    st.session_state[f"diskusi_{akhiran}"] = (
-        "Bandingkan sistem pemrosesan transaksi, sistem informasi manajemen, dan sistem pendukung keputusan."
-    )
-    st.session_state[f"tugas_{akhiran}"] = (
-        "Jelaskan pengaruh kualitas informasi dan penerimaan pengguna terhadap keberhasilan sistem."
-    )
+    if memakai_bahasa_inggris():
+        st.session_state[f"materi_{akhiran}"] = (
+            "Information systems combine people, processes, data, and technology to support operations "
+            "and decision-making. Transaction processing systems record routine activities, management "
+            "information systems turn operational data into reports, and decision support systems use "
+            "models and analysis for semi-structured decisions. System quality, information quality, "
+            "security, user adoption, and business alignment are important measures of success."
+        )
+        st.session_state[f"diskusi_{akhiran}"] = (
+            "Compare transaction processing, management information, and decision support systems."
+        )
+        st.session_state[f"tugas_{akhiran}"] = (
+            "Explain how information quality and user adoption affect system success."
+        )
+    else:
+        st.session_state[f"materi_{akhiran}"] = CONTOH_MATERI
+        st.session_state[f"diskusi_{akhiran}"] = (
+            "Bandingkan sistem pemrosesan transaksi, sistem informasi manajemen, dan sistem pendukung keputusan."
+        )
+        st.session_state[f"tugas_{akhiran}"] = (
+            "Jelaskan pengaruh kualitas informasi dan penerimaan pengguna terhadap keberhasilan sistem."
+        )
 
 
 def judul_langkah(nomor: int, judul: str, penjelasan: str) -> None:
@@ -1044,16 +1394,22 @@ def judul_langkah(nomor: int, judul: str, penjelasan: str) -> None:
 
 def pemutar_audio(teks: str, identitas: str) -> None:
     teks_terenkripsi = base64.b64encode(teks.encode("utf-8")).decode("ascii")
+    label_audio = tx("Pembaca audio", "Audio reader")
+    label_putar = tx("▶ Putar", "▶ Play")
+    label_jeda = tx("Jeda / lanjut", "Pause / resume")
+    label_henti = tx("Hentikan", "Stop")
+    label_id = tx("Bahasa Indonesia", "Indonesian")
+    label_en = tx("Bahasa Inggris", "English")
     st.iframe(
         f"""
         <div style="font-family:Arial,sans-serif;background:#dbd5d1;border:1px solid #aa9d94;
                     border-radius:14px;padding:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:#40342b">
-          <strong style="color:#40342b;margin-right:8px">Pembaca audio</strong>
-          <button id="putar-{identitas}" style="border:1px solid #40342b;border-radius:999px;padding:8px 14px;background:#c8beb7;color:#40342b;cursor:pointer;font-weight:700">▶ Putar</button>
-          <button id="jeda-{identitas}" style="border:1px solid #40342b;border-radius:999px;padding:8px 14px;background:#dbd5d1;color:#40342b;cursor:pointer;font-weight:700">Jeda / lanjut</button>
-          <button id="henti-{identitas}" style="border:1px solid #40342b;border-radius:999px;padding:8px 14px;background:#dbd5d1;color:#40342b;cursor:pointer;font-weight:700">Hentikan</button>
+          <strong style="color:#40342b;margin-right:8px">{label_audio}</strong>
+          <button id="putar-{identitas}" style="border:1px solid #40342b;border-radius:999px;padding:8px 14px;background:#c8beb7;color:#40342b;cursor:pointer;font-weight:700">{label_putar}</button>
+          <button id="jeda-{identitas}" style="border:1px solid #40342b;border-radius:999px;padding:8px 14px;background:#dbd5d1;color:#40342b;cursor:pointer;font-weight:700">{label_jeda}</button>
+          <button id="henti-{identitas}" style="border:1px solid #40342b;border-radius:999px;padding:8px 14px;background:#dbd5d1;color:#40342b;cursor:pointer;font-weight:700">{label_henti}</button>
           <select id="bahasa-{identitas}" style="padding:7px;border-radius:8px;border:1px solid #40342b;background:#dbd5d1;color:#40342b">
-            <option value="id-ID">Bahasa Indonesia</option><option value="en-US">Bahasa Inggris</option>
+            <option value="id-ID">{label_id}</option><option value="en-US">{label_en}</option>
           </select>
         </div>
         <script>
@@ -1078,23 +1434,29 @@ def tampilkan_hasil(
     paket: dict[str, Any], mata_kuliah: dict[str, Any], nomor_sesi: int, diperbarui: str
 ) -> None:
     tab_ringkasan, tab_kisi, tab_flash, tab_kuis = st.tabs(
-        ["Ringkasan & audio", "Kisi-kisi UAS", "Flashcard", "Kuis latihan"]
+        [
+            tx("Ringkasan & audio", "Summary & audio"),
+            tx("Kisi-kisi UAS", "Final-exam focus"),
+            tx("Flashcard", "Flashcards"),
+            tx("Kuis latihan", "Practice quiz"),
+        ]
     )
     with tab_ringkasan:
         st.markdown(paket["summary"])
         pemutar_audio(paket["summary"], f"{mata_kuliah['id']}-{nomor_sesi}")
-        st.markdown("#### Poin penting")
+        st.markdown(tx("#### Poin penting", "#### Key points"))
         for poin in paket.get("key_points", []):
             st.markdown(f"- {poin}")
         if paket.get("study_plan"):
-            st.markdown("#### Urutan belajar yang disarankan")
+            st.markdown(tx("#### Urutan belajar yang disarankan", "#### Suggested study sequence"))
             for indeks, tindakan in enumerate(paket["study_plan"], start=1):
                 st.markdown(f"{indeks}. {tindakan}")
 
     with tab_kisi:
-        st.caption(
-            "Kisi-kisi ini adalah prioritas belajar berdasarkan materi yang Anda masukkan, bukan jaminan soal UAS."
-        )
+        st.caption(tx(
+            "Kisi-kisi ini adalah prioritas belajar berdasarkan materi yang Anda masukkan, bukan jaminan soal UAS.",
+            "These are study priorities inferred from your material, not guaranteed final-exam questions.",
+        ))
         for prediksi in paket.get("exam_predictions", []):
             st.markdown(
                 "<div class='kotak-prediksi'>"
@@ -1132,7 +1494,7 @@ def tampilkan_hasil(
                         key=f"kuis_{mata_kuliah['id']}_{nomor_sesi}_{indeks}_{kunci_formulir}",
                     )
                 )
-            periksa = st.form_submit_button("Periksa jawaban", type="primary")
+            periksa = st.form_submit_button(tx("Periksa jawaban", "Check my answers"), type="primary")
         if periksa:
             skor = 0
             for indeks, (soal, jawaban_dipilih) in enumerate(
@@ -1141,23 +1503,66 @@ def tampilkan_hasil(
                 jawaban_benar = soal["options"][soal["answer_index"]]
                 if jawaban_dipilih == jawaban_benar:
                     skor += 1
-                    st.success(f"Soal {indeks}: benar")
+                    st.success(tx(f"Soal {indeks}: benar", f"Question {indeks}: correct"))
                 else:
-                    st.error(f"Soal {indeks}: jawaban yang benar adalah {jawaban_benar}")
+                    st.error(tx(
+                        f"Soal {indeks}: jawaban yang benar adalah {jawaban_benar}",
+                        f"Question {indeks}: the correct answer is {jawaban_benar}",
+                    ))
                 if soal.get("explanation"):
                     st.caption(soal["explanation"])
-            st.metric("Nilai kuis", f"{skor}/{len(daftar_kuis)}")
+            st.metric(tx("Nilai kuis", "Quiz score"), f"{skor}/{len(daftar_kuis)}")
 
 
 def tampilkan_hero() -> None:
+    kicker = tx("RUANG BELAJAR SISTEM INFORMASI UT", "UT INFORMATION SYSTEMS STUDY SPACE")
+    judul = tx(
+        "Belajar lebih terarah, satu sesi setiap kali.",
+        "Study with direction, one session at a time.",
+    )
+    deskripsi = tx(
+        "Pilih mata kuliah, simpan bahan Tuton per sesi, lalu ubah catatan Anda menjadi ringkasan, kisi-kisi UAS, flashcard, kuis, dan audio.",
+        "Choose a course, save each tutorial session, then turn your notes into summaries, exam focus, flashcards, quizzes, and audio.",
+    )
     st.markdown(
-        """
+        f"""
         <div class="hero-ut">
-          <div class="kicker">RUANG BELAJAR SISTEM INFORMASI UT</div>
-          <h1>Belajar lebih terarah, satu sesi setiap kali.</h1>
-          <p>Pilih mata kuliah, simpan bahan Tuton per sesi, lalu ubah catatan Anda menjadi ringkasan, kisi-kisi UAS, flashcard, kuis, dan audio.</p>
+          <div class="kicker">{kicker}</div>
+          <h1>{judul}</h1>
+          <p>{deskripsi}</p>
         </div>
         """,
+        unsafe_allow_html=True,
+    )
+
+
+def tampilkan_sapaan_harian() -> None:
+    sekarang = waktu_lokal()
+    jam = sekarang.hour
+    if jam < 11:
+        sapaan = tx("Selamat pagi", "Good morning")
+    elif jam < 15:
+        sapaan = tx("Selamat siang", "Good afternoon")
+    elif jam < 19:
+        sapaan = tx("Selamat sore", "Good evening")
+    else:
+        sapaan = tx("Selamat malam", "Good evening")
+    kutipan = KUTIPAN_HARIAN[sekarang.date().toordinal() % len(KUTIPAN_HARIAN)]
+    teks_kutipan = kutipan[1] if memakai_bahasa_inggris() else kutipan[0]
+    label = tx("Reality check hari ini", "Today's reality check")
+    st.markdown(
+        "<div class='sapaan-harian'>"
+        f"<strong>{html.escape(sapaan)}, Elsa 👋</strong>"
+        f"<div class='teks-bantu'>{html.escape(label)} · {sekarang.strftime('%d %b %Y')}</div>"
+        f"<div class='kutipan-harian'>“{html.escape(teks_kutipan)}”</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def kotak_petunjuk(indonesia: str, english: str) -> None:
+    st.markdown(
+        f"<div class='petunjuk-ringkas'>{html.escape(tx(indonesia, english))}</div>",
         unsafe_allow_html=True,
     )
 
@@ -1176,42 +1581,105 @@ if semester_baru in semester_per_id:
 
 with st.sidebar:
     st.markdown("## UT Study Prep")
-    st.caption("Pendamping belajar SI UT")
+    st.selectbox(
+        "Bahasa / Language",
+        ["Bahasa Indonesia", "English"],
+        key="bahasa_antarmuka",
+    )
+    st.caption(tx("Pendamping belajar SI UT", "Your UT Information Systems study companion"))
+    nama_halaman = {
+        "Ruang belajar": tx("Ruang belajar", "Study space"),
+        "Atur semester": tx("Atur semester", "Semester setup"),
+        "Katalog SI": tx("Katalog SI", "IS catalog"),
+    }
     halaman = st.radio(
-        "Menu utama",
+        tx("Menu utama", "Main menu"),
         ["Ruang belajar", "Atur semester", "Katalog SI"],
+        format_func=lambda pilihan: nama_halaman[pilihan],
         index=0 if ada_mata_kuliah_aktif else 1,
         key="menu_utama",
     )
     st.divider()
-    st.markdown("#### Mesin ringkasan")
+    st.markdown(tx("#### Mesin ringkasan", "#### Summary engine"))
+    nama_penyedia = {
+        "Lokal (tanpa API)": tx("Lokal (tanpa API)", "Offline (no API key)"),
+        "Google Gemini": "Google Gemini",
+        "Groq": "Groq",
+    }
     penyedia = st.selectbox(
-        "Pilih mesin",
+        tx("Pilih mesin", "Choose an engine"),
         ["Lokal (tanpa API)", "Google Gemini", "Groq"],
-        help="Mode lokal selalu tersedia. Gemini dan Groq menggunakan kuota dari masing-masing penyedia.",
+        format_func=lambda pilihan: nama_penyedia[pilihan],
+        help=tx(
+            "Mode lokal selalu tersedia. Gemini dan Groq menggunakan kuota dari masing-masing penyedia.",
+            "Offline mode is always available. Gemini and Groq use each provider's own quota.",
+        ),
     )
     if penyedia == "Google Gemini":
         kunci_api = st.text_input(
-            "Kunci API Gemini",
+            tx("Kunci API Gemini", "Gemini API key"),
             value=ambil_rahasia("GEMINI_API_KEY"),
             type="password",
-            help="Kunci yang diketik tidak disimpan ke SQLite.",
+            placeholder=tx("Tempel kunci API Gemini", "Paste your Gemini API key"),
+            help=tx("Kunci yang diketik tidak disimpan ke SQLite.", "The key you enter is not saved to SQLite."),
         )
-        model = st.text_input("Model Gemini", value="gemini-2.5-flash", key="model_gemini")
-        st.link_button("Buka halaman kunci Gemini", "https://aistudio.google.com/app/apikey")
+        model = st.text_input(tx("Model Gemini", "Gemini model"), value="gemini-2.5-flash", key="model_gemini")
+        st.link_button(tx("Buka halaman kunci Gemini", "Open Gemini API keys"), "https://aistudio.google.com/app/apikey")
     elif penyedia == "Groq":
         kunci_api = st.text_input(
-            "Kunci API Groq",
+            tx("Kunci API Groq", "Groq API key"),
             value=ambil_rahasia("GROQ_API_KEY"),
             type="password",
-            help="Kunci yang diketik tidak disimpan ke SQLite.",
+            placeholder=tx("Tempel kunci API Groq", "Paste your Groq API key"),
+            help=tx("Kunci yang diketik tidak disimpan ke SQLite.", "The key you enter is not saved to SQLite."),
         )
-        model = st.text_input("Model Groq", value="llama-3.3-70b-versatile", key="model_groq")
-        st.link_button("Buka halaman kunci Groq", "https://console.groq.com/keys")
+        model = st.text_input(tx("Model Groq", "Groq model"), value="llama-3.3-70b-versatile", key="model_groq")
+        st.link_button(tx("Buka halaman kunci Groq", "Open Groq API keys"), "https://console.groq.com/keys")
     else:
         kunci_api, model = "", "mesin-lokal"
+
+    with st.expander(tx("Pengaturan email (SMTP)", "Email settings (SMTP)")):
+        st.caption(tx(
+            "Gunakan kata sandi aplikasi, bukan kata sandi utama akun email. Data ini tidak disimpan ke SQLite.",
+            "Use an app password, not your main email password. These settings are not saved to SQLite.",
+        ))
+        smtp_host = st.text_input(
+            tx("Host SMTP", "SMTP host"),
+            value=ambil_rahasia("SMTP_HOST") or "smtp.gmail.com",
+            placeholder="smtp.gmail.com",
+            key="smtp_host",
+        )
+        try:
+            port_awal = int(ambil_rahasia("SMTP_PORT") or 587)
+        except ValueError:
+            port_awal = 587
+        smtp_port = int(st.number_input(
+            tx("Port SMTP", "SMTP port"), min_value=1, max_value=65535,
+            value=port_awal, key="smtp_port",
+        ))
+        smtp_user = st.text_input(
+            tx("Nama pengguna SMTP", "SMTP username"),
+            value=ambil_rahasia("SMTP_USER"),
+            placeholder=tx("biasanya alamat email Anda", "usually your email address"),
+            key="smtp_user",
+        )
+        smtp_password = st.text_input(
+            tx("Kata sandi aplikasi", "App password"),
+            value=ambil_rahasia("SMTP_PASSWORD"),
+            type="password",
+            placeholder=tx("tempel kata sandi aplikasi", "paste your app password"),
+            key="smtp_password",
+        )
+        smtp_from = st.text_input(
+            tx("Alamat pengirim", "Sender address"),
+            value=ambil_rahasia("SMTP_FROM") or smtp_user,
+            placeholder=tx("contoh: elsa@gmail.com", "example: elsa@gmail.com"),
+            key="smtp_from",
+        )
     st.divider()
-    st.caption(f"Penyimpanan lokal: `{LOKASI_DB.name}`")
+    st.caption(tx(f"Penyimpanan lokal: `{LOKASI_DB.name}`", f"Local storage: `{LOKASI_DB.name}`"))
+
+tampilkan_sapaan_harian()
 
 
 if halaman == "Ruang belajar":
@@ -1220,12 +1688,19 @@ if halaman == "Ruang belajar":
     with st.container(border=True):
         judul_langkah(
             1,
-            "Pilih semester dan mata kuliah",
-            "Buka mata kuliah aktif yang sedang Anda pelajari.",
+            tx("Pilih semester dan mata kuliah", "Choose a semester and course"),
+            tx(
+                "Buka mata kuliah aktif yang sedang Anda pelajari.",
+                "Open the active course you are studying now.",
+            ),
+        )
+        kotak_petunjuk(
+            "📌 Langkah 1: Pilih semester dan mata kuliah yang sedang Anda pelajari.",
+            "📌 Step 1: Choose the semester and course you are currently studying.",
         )
         kolom_semester, kolom_mata_kuliah = st.columns(2)
         semester_id = kolom_semester.selectbox(
-            "Semester",
+            tx("Semester", "Semester"),
             options=list(semester_per_id),
             format_func=lambda identitas: semester_per_id[identitas]["name"],
             key="semester_belajar",
@@ -1233,89 +1708,130 @@ if halaman == "Ruang belajar":
         mata_kuliah_aktif = daftar_mata_kuliah(semester_id)
         if not mata_kuliah_aktif:
             kolom_mata_kuliah.selectbox(
-                "Mata kuliah",
-                options=["Belum ada mata kuliah aktif"],
+                tx("Mata kuliah", "Course"),
+                options=[tx("Belum ada mata kuliah aktif", "No active course yet")],
                 disabled=True,
             )
             st.warning(
-                "Semester ini belum memiliki mata kuliah aktif. Buka menu Atur semester untuk memilih mata kuliah."
+                tx(
+                    "Semester ini belum memiliki mata kuliah aktif. Buka menu Atur semester untuk memilih mata kuliah.",
+                    "This semester has no active courses. Open Semester setup to choose your courses.",
+                )
             )
             st.stop()
         mata_kuliah_per_id = {int(item["id"]): item for item in mata_kuliah_aktif}
         mata_kuliah_id = kolom_mata_kuliah.selectbox(
-            "Mata kuliah",
+            tx("Mata kuliah", "Course"),
             options=list(mata_kuliah_per_id),
             format_func=lambda identitas: (
-                f"{mata_kuliah_per_id[identitas]['code']} — {mata_kuliah_per_id[identitas]['name']}"
+                f"{mata_kuliah_per_id[identitas]['code']} — "
+                f"{nama_tampilan(mata_kuliah_per_id[identitas]['code'], mata_kuliah_per_id[identitas]['name'])}"
             ),
             key=f"mata_kuliah_belajar_{semester_id}",
         )
         mata_kuliah = mata_kuliah_per_id[mata_kuliah_id]
+        mata_kuliah_bahasa = {
+            **mata_kuliah,
+            "name": nama_tampilan(mata_kuliah["code"], mata_kuliah["name"]),
+        }
         st.markdown(
             f"<span class='label-kecil'>{html.escape(mata_kuliah['code'])}</span>"
-            f"<span class='label-kecil'>{mata_kuliah['credits']} SKS</span>",
+            f"<span class='label-kecil'>{mata_kuliah['credits']} {tx('SKS', 'credits')}</span>",
             unsafe_allow_html=True,
         )
 
     with st.container(border=True):
         judul_langkah(
             2,
-            "Pilih sesi dan masukkan bahan Tuton",
-            "Setiap mata kuliah menyimpan Sesi 1 sampai Sesi 8 secara terpisah.",
+            tx("Pilih sesi dan masukkan bahan Tuton", "Choose a session and add Tuton materials"),
+            tx(
+                "Setiap mata kuliah menyimpan Sesi 1 sampai Sesi 8 secara terpisah.",
+                "Each course stores Sessions 1 through 8 separately.",
+            ),
+        )
+        kotak_petunjuk(
+            "📌 Langkah 2: Pilih Sesi 1–8, lalu tempel bahan Tuton, diskusi, atau tugas.",
+            "📌 Step 2: Choose Sessions 1–8, then paste your Tuton materials, discussion, or assignment.",
         )
         nomor_sesi = st.radio(
-            "Sesi tutorial",
+            tx("Sesi tutorial", "Tutorial session"),
             options=list(range(1, 9)),
-            format_func=lambda nomor: f"Sesi {nomor}",
+            format_func=lambda nomor: tx(f"Sesi {nomor}", f"Session {nomor}"),
             horizontal=True,
             key=f"sesi_{mata_kuliah_id}",
         )
         data_sesi = ambil_sesi(mata_kuliah_id, nomor_sesi)
         akhiran = f"{mata_kuliah_id}_{nomor_sesi}"
         materi = st.text_area(
-            "Materi atau ringkasan Tuton",
+            tx("Materi atau ringkasan Tuton", "Tuton material or notes"),
             value=data_sesi["material"],
             height=240,
-            placeholder="Tempel ringkasan modul, penjelasan Tuton, atau poin belajar di sini…",
+            placeholder=tx(
+                "Tempel ringkasan modul, penjelasan Tuton, atau poin belajar di sini…",
+                "Paste module notes, Tuton explanations, or key study points here…",
+            ),
             key=f"materi_{akhiran}",
         )
         kolom_diskusi, kolom_tugas = st.columns(2)
         with kolom_diskusi:
             diskusi = st.text_area(
-                "Pertanyaan diskusi",
+                tx("Pertanyaan diskusi", "Discussion questions"),
                 value=data_sesi["discussion"],
                 height=135,
-                placeholder="Tempel pertanyaan atau jawaban diskusi…",
+                placeholder=tx(
+                    "Tempel pertanyaan atau jawaban diskusi…",
+                    "Paste discussion questions or answers…",
+                ),
                 key=f"diskusi_{akhiran}",
             )
         with kolom_tugas:
             tugas = st.text_area(
-                "Tugas",
+                tx("Tugas", "Assignment"),
                 value=data_sesi["assignments"],
                 height=135,
-                placeholder="Tempel instruksi atau jawaban tugas…",
+                placeholder=tx(
+                    "Tempel instruksi atau jawaban tugas…",
+                    "Paste assignment instructions or your answer…",
+                ),
                 key=f"tugas_{akhiran}",
             )
         tombol_simpan, tombol_contoh, ruang_kosong = st.columns([1, 1, 3])
-        simpan_diklik = tombol_simpan.button("Simpan bahan", width="stretch")
+        simpan_diklik = tombol_simpan.button(
+            tx("Simpan bahan", "Save materials"), width="stretch"
+        )
         tombol_contoh.button(
-            "Isi contoh",
+            tx("Isi contoh", "Load example"),
             width="stretch",
             on_click=isi_contoh,
             args=(mata_kuliah_id, nomor_sesi),
         )
         if simpan_diklik:
             simpan_catatan_sesi(mata_kuliah_id, nomor_sesi, materi, diskusi, tugas)
-            st.success(f"Bahan Sesi {nomor_sesi} berhasil disimpan.")
+            st.success(
+                tx(
+                    f"Bahan Sesi {nomor_sesi} berhasil disimpan.",
+                    f"Materials for Session {nomor_sesi} were saved.",
+                )
+            )
 
     with st.container(border=True):
         judul_langkah(
             3,
-            "Buat ringkasan dan prediksi UAS",
-            "Hasil akan tersimpan pada mata kuliah dan sesi yang dipilih.",
+            tx("Buat ringkasan dan prediksi UAS", "Generate a summary and final-exam forecast"),
+            tx(
+                "Hasil akan tersimpan pada mata kuliah dan sesi yang dipilih.",
+                "Your results will be saved under the selected course and session.",
+            ),
+        )
+        kotak_petunjuk(
+            "📌 Langkah 3: Buat paket belajar untuk melihat ringkasan, kisi-kisi, kuis, dan audio.",
+            "📌 Step 3: Generate a study pack to see the summary, exam guide, quiz, and audio.",
         )
         buat_diklik = st.button(
-            "Buat Ringkasan & Prediksi UAS",
+            tx(
+                "Buat Ringkasan & Prediksi UAS",
+                "Generate Summary & Final Exam Predictions",
+            ),
             type="primary",
             width="stretch",
         )
@@ -1323,13 +1839,23 @@ if halaman == "Ruang belajar":
         if buat_diklik:
             panjang_teks = len(materi.strip()) + len(diskusi.strip()) + len(tugas.strip())
             if panjang_teks < 80:
-                st.error("Masukkan sedikitnya 80 karakter bahan Tuton agar hasilnya bermakna.")
+                st.error(
+                    tx(
+                        "Masukkan sedikitnya 80 karakter bahan Tuton agar hasilnya bermakna.",
+                        "Enter at least 80 characters of Tuton material for a meaningful result.",
+                    )
+                )
             else:
                 try:
-                    with st.spinner(f"Menyusun paket belajar dengan {penyedia}…"):
+                    with st.spinner(
+                        tx(
+                            f"Menyusun paket belajar dengan {nama_penyedia[penyedia]}…",
+                            f"Building your study pack with {nama_penyedia[penyedia]}…",
+                        )
+                    ):
                         paket = buat_paket_belajar(
                             penyedia,
-                            mata_kuliah,
+                            mata_kuliah_bahasa,
                             nomor_sesi,
                             materi,
                             diskusi,
@@ -1348,47 +1874,130 @@ if halaman == "Ruang belajar":
                     )
                     data_sesi = ambil_sesi(mata_kuliah_id, nomor_sesi)
                     st.success(
-                        f"Paket belajar {mata_kuliah['code']} · Sesi {nomor_sesi} berhasil dibuat dan disimpan."
+                        tx(
+                            f"Paket belajar {mata_kuliah['code']} · Sesi {nomor_sesi} berhasil dibuat dan disimpan.",
+                            f"Study pack for {mata_kuliah['code']} · Session {nomor_sesi} was generated and saved.",
+                        )
                     )
                 except KesalahanPenyedia as exc:
                     st.error(str(exc))
 
     if paket:
-        st.markdown("## Hasil belajar")
+        st.markdown(tx("## Hasil belajar", "## Study results"))
         st.caption(
-            f"{mata_kuliah['code']} · Sesi {nomor_sesi} · Dibuat dengan {data_sesi.get('provider') or penyedia}"
+            tx(
+                f"{mata_kuliah['code']} · Sesi {nomor_sesi} · Dibuat dengan "
+                f"{nama_penyedia.get(data_sesi.get('provider') or penyedia, data_sesi.get('provider') or penyedia)}",
+                f"{mata_kuliah['code']} · Session {nomor_sesi} · Generated with "
+                f"{nama_penyedia.get(data_sesi.get('provider') or penyedia, data_sesi.get('provider') or penyedia)}",
+            )
         )
         tampilkan_hasil(
             paket,
-            mata_kuliah,
+            mata_kuliah_bahasa,
             nomor_sesi,
             data_sesi.get("updated_at", ""),
         )
+
+        with st.container(border=True):
+            st.markdown(
+                tx(
+                    "### 📧 Kirim ringkasan belajar",
+                    "### 📧 Email today's learning summary",
+                )
+            )
+            kotak_petunjuk(
+                "📌 Masukkan email tujuan dan jadwal belajar. Pastikan pengaturan SMTP di bilah samping sudah lengkap.",
+                "📌 Enter the recipient email and your study schedule. Make sure the SMTP settings in the sidebar are complete.",
+            )
+            with st.form(f"form_email_{mata_kuliah_id}_{nomor_sesi}"):
+                alamat_email = st.text_input(
+                    tx("Email tujuan", "Email address"),
+                    placeholder="elsa@example.com",
+                )
+                jadwal_email = st.text_area(
+                    tx("Jadwal atau pengingat belajar", "Study schedule or reminder"),
+                    placeholder=tx(
+                        "Contoh: Ulangi Sesi 3 hari Sabtu pukul 19.00 selama 45 menit.",
+                        "Example: Review Session 3 on Saturday at 7:00 PM for 45 minutes.",
+                    ),
+                    height=110,
+                )
+                kirim_diklik = st.form_submit_button(
+                    tx(
+                        "📧 Kirim Ringkasan & Jadwal Belajar Hari Ini ke Email Saya",
+                        "📧 Send Today's Learning Summary & Schedule to My Email",
+                    ),
+                    type="primary",
+                )
+            if kirim_diklik:
+                try:
+                    with st.spinner(tx("Mengirim email…", "Sending email…")):
+                        kirim_email_belajar(
+                            alamat_email,
+                            jadwal_email,
+                            mata_kuliah_bahasa,
+                            nomor_sesi,
+                            paket,
+                            smtp_host,
+                            smtp_port,
+                            smtp_user,
+                            smtp_password,
+                            smtp_from,
+                        )
+                except (ValueError, OSError, smtplib.SMTPException) as exc:
+                    st.error(
+                        tx(
+                            f"Email belum terkirim: {exc}",
+                            f"The email could not be sent: {exc}",
+                        )
+                    )
+                else:
+                    st.success(
+                        tx(
+                            f"Ringkasan dan jadwal berhasil dikirim ke {alamat_email}.",
+                            f"The summary and schedule were sent to {alamat_email}.",
+                        )
+                    )
     else:
-        st.info("Hasil akan muncul di sini setelah Anda membuat paket belajar.")
+        st.info(
+            tx(
+                "Hasil akan muncul di sini setelah Anda membuat paket belajar.",
+                "Your results will appear here after you generate a study pack.",
+            )
+        )
 
 elif halaman == "Atur semester":
     st.markdown(
-        """
+        f"""
         <div class="hero-ut">
-          <div class="kicker">PENGATURAN NON-SIPAS</div>
-          <h1>Susun semester sesuai rencana Anda.</h1>
-          <p>Pilih mata kuliah aktif dari katalog SI atau tambahkan mata kuliah khusus.</p>
+          <div class="kicker">{html.escape(tx('PENGATURAN NON-SIPAS', 'NON-SIPAS SETUP'))}</div>
+          <h1>{html.escape(tx('Susun semester sesuai rencana Anda.', 'Build a semester that fits your plan.'))}</h1>
+          <p>{html.escape(tx('Pilih mata kuliah aktif dari katalog SI atau tambahkan mata kuliah khusus.', 'Choose active courses from the IS catalog or add a custom course.'))}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
+    kotak_petunjuk(
+        "📌 Langkah 1: Masukkan nama semester baru di bawah jika belum tersedia.",
+        "📌 Step 1: Enter the name of a new semester below if it is not available yet.",
+    )
     semester_id = st.selectbox(
-        "Semester yang akan diatur",
+        tx("Semester yang akan diatur", "Semester to configure"),
         options=list(semester_per_id),
         format_func=lambda identitas: semester_per_id[identitas]["name"],
         key="semester_pengaturan",
     )
-    with st.expander("Buat semester baru"):
+    with st.expander(tx("Buat semester baru", "Create a new semester")):
         with st.form("form_semester_baru", clear_on_submit=True):
-            nama_semester_baru = st.text_input("Nama semester", placeholder="Contoh: Semester 5")
-            buat_semester_diklik = st.form_submit_button("Buat semester", type="primary")
+            nama_semester_baru = st.text_input(
+                tx("Nama semester", "Semester name"),
+                placeholder=tx("Contoh: Semester 5", "Example: Semester 5"),
+            )
+            buat_semester_diklik = st.form_submit_button(
+                tx("Buat semester", "Create semester"), type="primary"
+            )
         if buat_semester_diklik:
             try:
                 id_baru = buat_semester(nama_semester_baru)
@@ -1404,57 +2013,89 @@ elif halaman == "Atur semester":
     aktif = [item for item in seluruh_mata_kuliah if item["active"]]
     jumlah_sks = sum(int(item["credits"]) for item in aktif)
     metrik_satu, metrik_dua, metrik_tiga = st.columns(3)
-    metrik_satu.metric("Mata kuliah aktif", len(aktif))
-    metrik_dua.metric("Beban semester", f"{jumlah_sks} SKS")
-    metrik_tiga.metric("Katalog SI", "51 mata kuliah")
+    metrik_satu.metric(tx("Mata kuliah aktif", "Active courses"), len(aktif))
+    metrik_dua.metric(tx("Beban semester", "Semester load"), tx(f"{jumlah_sks} SKS", f"{jumlah_sks} credits"))
+    metrik_tiga.metric(tx("Katalog SI", "IS catalog"), tx("51 mata kuliah", "51 courses"))
 
     with st.container(border=True):
-        st.markdown("### Pilih mata kuliah aktif")
-        st.caption("Kelompok agama dan mata kuliah pilihan ditampilkan sebagai pilihan kode yang terpisah.")
+        kotak_petunjuk(
+            "📌 Langkah 2: Centang mata kuliah yang sedang Anda ambil.",
+            "📌 Step 2: Check the courses you are currently taking.",
+        )
+        st.markdown(tx("### Pilih mata kuliah aktif", "### Choose active courses"))
+        st.caption(
+            tx(
+                "Kelompok agama dan mata kuliah pilihan ditampilkan sebagai pilihan kode yang terpisah.",
+                "Religion and elective groups are shown as separate course-code options.",
+            )
+        )
         with st.form(f"form_katalog_{semester_id}"):
             pilihan_kode = st.multiselect(
-                "Mata kuliah semester ini",
+                tx("Mata kuliah semester ini", "Courses for this semester"),
                 options=[item["kode"] for item in DAFTAR_PENAWARAN],
                 default=kode_aktif,
                 format_func=lambda kode: (
-                    f"{kode} — {PENAWARAN_PER_KODE[kode]['nama']} · {PENAWARAN_PER_KODE[kode]['sks']} SKS"
+                    f"{kode} — {nama_tampilan(kode, PENAWARAN_PER_KODE[kode]['nama'])} · "
+                    f"{PENAWARAN_PER_KODE[kode]['sks']} {tx('SKS', 'credits')}"
+                ),
+                placeholder=tx(
+                    "Pilih satu atau beberapa mata kuliah",
+                    "Choose one or more courses",
                 ),
                 key=f"pilihan_katalog_{semester_id}",
             )
-            simpan_pilihan = st.form_submit_button("Simpan mata kuliah aktif", type="primary")
+            simpan_pilihan = st.form_submit_button(
+                tx("Simpan mata kuliah aktif", "Save active courses"), type="primary"
+            )
         if simpan_pilihan:
             sinkronkan_mata_kuliah(semester_id, pilihan_kode)
-            st.success("Daftar mata kuliah aktif berhasil disimpan.")
+            st.success(
+                tx(
+                    "Daftar mata kuliah aktif berhasil disimpan.",
+                    "The active course list was saved.",
+                )
+            )
 
-    with st.expander("Tambahkan mata kuliah khusus"):
+    with st.expander(tx("Tambahkan mata kuliah khusus", "Add a custom course")):
         with st.form(f"form_mata_kuliah_khusus_{semester_id}", clear_on_submit=True):
             kolom_kode, kolom_nama, kolom_sks = st.columns([1, 2, 1])
-            kode_khusus = kolom_kode.text_input("Kode", placeholder="KHUSUS01")
-            nama_khusus = kolom_nama.text_input("Nama mata kuliah")
-            sks_khusus = kolom_sks.number_input("SKS", min_value=1, max_value=24, value=3)
-            tambah_diklik = st.form_submit_button("Tambahkan mata kuliah")
+            kode_khusus = kolom_kode.text_input(tx("Kode", "Code"), placeholder="CUSTOM01")
+            nama_khusus = kolom_nama.text_input(
+                tx("Nama mata kuliah", "Course name"),
+                placeholder=tx("Contoh: Seminar khusus", "Example: Special seminar"),
+            )
+            sks_khusus = kolom_sks.number_input(
+                tx("SKS", "Credits"), min_value=1, max_value=24, value=3
+            )
+            tambah_diklik = st.form_submit_button(
+                tx("Tambahkan mata kuliah", "Add course")
+            )
         if tambah_diklik:
             try:
                 tambah_mata_kuliah_khusus(
                     semester_id, kode_khusus, nama_khusus, int(sks_khusus)
                 )
-                st.success("Mata kuliah khusus berhasil ditambahkan.")
+                st.success(tx("Mata kuliah khusus berhasil ditambahkan.", "The custom course was added."))
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))
 
-    st.markdown("### Mata kuliah aktif")
+    kotak_petunjuk(
+        "📌 Langkah 3: Simpan pilihan, lalu kembali ke Ruang belajar.",
+        "📌 Step 3: Save your choices, then return to Study space.",
+    )
+    st.markdown(tx("### Mata kuliah aktif", "### Active courses"))
     aktif = daftar_mata_kuliah(semester_id)
     if not aktif:
-        st.info("Belum ada mata kuliah aktif pada semester ini.")
+        st.info(tx("Belum ada mata kuliah aktif pada semester ini.", "There are no active courses in this semester yet."))
     else:
         st.dataframe(
             [
                 {
-                    "Kode": item["code"],
-                    "Mata kuliah": item["name"],
-                    "SKS": item["credits"],
-                    "Sumber": "Tambahan" if item["is_custom"] else "Katalog UT",
+                    tx("Kode", "Code"): item["code"],
+                    tx("Mata kuliah", "Course"): nama_tampilan(item["code"], item["name"]),
+                    tx("SKS", "Credits"): item["credits"],
+                    tx("Sumber", "Source"): tx("Tambahan", "Custom") if item["is_custom"] else tx("Katalog UT", "UT catalog"),
                 }
                 for item in aktif
             ],
@@ -1463,18 +2104,19 @@ elif halaman == "Atur semester":
         )
         tambahan = [item for item in aktif if item["is_custom"]]
         if tambahan:
-            with st.expander("Kelola mata kuliah khusus"):
+            with st.expander(tx("Kelola mata kuliah khusus", "Manage custom courses")):
                 for item in tambahan:
                     kolom_info, kolom_hapus = st.columns([5, 1])
                     kolom_info.write(
-                        f"**{item['code']}** — {item['name']} ({item['credits']} SKS)"
+                        f"**{item['code']}** — {item['name']} "
+                        f"({item['credits']} {tx('SKS', 'credits')})"
                     )
-                    if kolom_hapus.button("Hapus", key=f"hapus_{item['id']}"):
+                    if kolom_hapus.button(tx("Hapus", "Delete"), key=f"hapus_{item['id']}"):
                         hapus_mata_kuliah_khusus(int(item["id"]))
                         st.rerun()
 
     st.download_button(
-        "Unduh cadangan semester",
+        tx("Unduh cadangan semester", "Download semester backup"),
         data=ekspor_semester(semester_id),
         file_name=f"{semester_per_id[semester_id]['name'].lower().replace(' ', '-')}-cadangan.json",
         mime="application/json",
@@ -1482,18 +2124,22 @@ elif halaman == "Atur semester":
 
 else:
     st.markdown(
-        """
+        f"""
         <div class="hero-ut">
-          <div class="kicker">KATALOG PROGRAM STUDI</div>
-          <h1>51 mata kuliah Sistem Informasi UT.</h1>
-          <p>Kelompok agama dan mata kuliah pilihan tetap dihitung sebagai satu slot kurikulum.</p>
+          <div class="kicker">{html.escape(tx('KATALOG PROGRAM STUDI', 'DEGREE CATALOG'))}</div>
+          <h1>{html.escape(tx('51 mata kuliah Sistem Informasi UT.', '51 UT Information Systems courses.'))}</h1>
+          <p>{html.escape(tx('Kelompok agama dan mata kuliah pilihan tetap dihitung sebagai satu slot kurikulum.', 'Religion and elective groups each count as one curriculum slot.'))}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    kotak_petunjuk(
+        "📌 Gunakan pencarian untuk menemukan kode atau nama mata kuliah.",
+        "📌 Use the search box to find a course code or name.",
+    )
     pencarian = st.text_input(
-        "Cari kode atau nama mata kuliah",
-        placeholder="Contoh: STSI44 atau keamanan",
+        tx("Cari kode atau nama mata kuliah", "Search by course code or name"),
+        placeholder=tx("Contoh: STSI44 atau keamanan", "Example: STSI44 or security"),
     )
     kata_cari = pencarian.strip().lower()
     hasil_katalog = [
@@ -1502,23 +2148,26 @@ else:
         if not kata_cari
         or kata_cari in item["kode"].lower()
         or kata_cari in item["nama"].lower()
+        or kata_cari in nama_slot_katalog(item).lower()
         or any(
-            kata_cari in opsi["kode"].lower() or kata_cari in opsi["nama"].lower()
+            kata_cari in opsi["kode"].lower()
+            or kata_cari in opsi["nama"].lower()
+            or kata_cari in nama_tampilan(opsi["kode"], opsi["nama"]).lower()
             for opsi in item.get("pilihan", [])
         )
     ]
     metrik_satu, metrik_dua, metrik_tiga = st.columns(3)
-    metrik_satu.metric("Jumlah mata kuliah", len(KATALOG_MK_UT))
-    metrik_dua.metric("Hasil ditampilkan", len(hasil_katalog))
-    metrik_tiga.metric("Total kurikulum", "145 SKS")
+    metrik_satu.metric(tx("Jumlah mata kuliah", "Course count"), len(KATALOG_MK_UT))
+    metrik_dua.metric(tx("Hasil ditampilkan", "Results shown"), len(hasil_katalog))
+    metrik_tiga.metric(tx("Total kurikulum", "Curriculum total"), tx("145 SKS", "145 credits"))
     st.dataframe(
         [
             {
-                "No.": item["slot"],
-                "Kode": item["kode"],
-                "Mata kuliah": item["nama"],
-                "SKS": item["sks"],
-                "Jenis": "Pilihan" if item.get("pilihan") else "Wajib",
+                tx("No.", "No."): item["slot"],
+                tx("Kode", "Code"): item["kode"],
+                tx("Mata kuliah", "Course"): nama_slot_katalog(item),
+                tx("SKS", "Credits"): item["sks"],
+                tx("Jenis", "Type"): tx("Pilihan", "Elective") if item.get("pilihan") else tx("Wajib", "Required"),
             }
             for item in hasil_katalog
         ],
@@ -1527,8 +2176,13 @@ else:
     )
     kelompok_pilihan = [item for item in hasil_katalog if item.get("pilihan")]
     if kelompok_pilihan:
-        with st.expander("Lihat rincian kelompok pilihan"):
+        with st.expander(tx("Lihat rincian kelompok pilihan", "View elective group details")):
             for item in kelompok_pilihan:
-                st.markdown(f"**Slot {item['slot']} · {item['nama']}**")
+                st.markdown(
+                    f"**{tx('Slot', 'Slot')} {item['slot']} · {nama_slot_katalog(item)}**"
+                )
                 for opsi in item["pilihan"]:
-                    st.markdown(f"- `{opsi['kode']}` — {opsi['nama']} ({item['sks']} SKS)")
+                    st.markdown(
+                        f"- `{opsi['kode']}` — {nama_tampilan(opsi['kode'], opsi['nama'])} "
+                        f"({item['sks']} {tx('SKS', 'credits')})"
+                    )
