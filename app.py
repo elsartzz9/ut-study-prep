@@ -916,7 +916,7 @@ def kirim_json(
         raise KesalahanPenyedia(tx(f"Layanan AI tidak dapat dihubungi: {exc}", f"The AI provider could not be reached: {exc}")) from exc
 
 
-def ambil_json(teks: str) -> dict[str, Any]:
+
 def ambil_objek_json(teks: str) -> dict[str, Any]:
     """Ambil satu objek JSON dari respons teks layanan AI."""
     hasil = teks.strip()
