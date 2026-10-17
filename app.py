@@ -1913,7 +1913,8 @@ if halaman == "Ruang belajar":
             with st.form(f"form_email_{mata_kuliah_id}_{nomor_sesi}"):
                 alamat_email = st.text_input(
                     tx("Email tujuan", "Email address"),
-                    placeholder="elsa@example.com",
+                    value="elsahaditiasitorus@gmail.com",
+                    placeholder="elsahaditiasitorus@gmail.com",
                 )
                 jadwal_email = st.text_area(
                     tx("Jadwal atau pengingat belajar", "Study schedule or reminder"),
