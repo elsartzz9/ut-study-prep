@@ -255,6 +255,27 @@ def siapkan_database() -> None:
                 UNIQUE (semester_course_id, session_number),
                 FOREIGN KEY (semester_course_id) REFERENCES semester_courses(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS ielts_practice (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                practice_type TEXT NOT NULL CHECK (practice_type IN ('Writing', 'Speaking')),
+                input_text TEXT NOT NULL,
+                feedback_json TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS language_vocabulary (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                language TEXT NOT NULL CHECK (language IN ('Mandarin', 'Vietnamese')),
+                term TEXT NOT NULL,
+                pronunciation TEXT NOT NULL,
+                indonesian_translation TEXT NOT NULL,
+                example_sentence TEXT NOT NULL,
+                tags TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE (language, term COLLATE NOCASE)
+            );
             """
         )
         koneksi.execute("PRAGMA journal_mode = WAL")
@@ -262,6 +283,27 @@ def siapkan_database() -> None:
             koneksi.execute(
                 "INSERT INTO semesters (name, created_at) VALUES (?, ?)",
                 ("Semester 1", waktu_sekarang()),
+            )
+
+        if koneksi.execute("SELECT id FROM language_vocabulary LIMIT 1").fetchone() is None:
+            kosakata_awal = [
+                ("Mandarin", "你好", "nǐ hǎo", "halo", "你好，很高兴认识你。", "percakapan sehari-hari"),
+                ("Mandarin", "学习", "xuéxí", "belajar", "我每天学习英语。", "pendidikan"),
+                ("Mandarin", "机会", "jīhuì", "kesempatan", "这是一个很好的机会。", "karier dan tujuan"),
+                ("Mandarin", "坚持", "jiānchí", "tekun; bertahan", "坚持就是胜利。", "motivasi"),
+                ("Vietnamese", "xin chào", "sin chào", "halo", "Xin chào, rất vui được gặp bạn.", "percakapan sehari-hari"),
+                ("Vietnamese", "học tập", "hok təp", "belajar", "Tôi học tiếng Việt mỗi ngày.", "pendidikan"),
+                ("Vietnamese", "cơ hội", "kə hoj", "kesempatan", "Đây là một cơ hội tốt.", "karier dan tujuan"),
+                ("Vietnamese", "kiên trì", "kien trì", "tekun; gigih", "Kiên trì sẽ dẫn đến thành công.", "motivasi"),
+            ]
+            koneksi.executemany(
+                """
+                INSERT INTO language_vocabulary
+                    (language, term, pronunciation, indonesian_translation,
+                     example_sentence, tags, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [(*item, waktu_sekarang()) for item in kosakata_awal],
             )
 
         # Migrasi aman dari versi lama: materi tingkat mata kuliah menjadi Sesi 1.
@@ -511,6 +553,101 @@ def ekspor_semester(semester_id: int) -> str:
         "mata_kuliah": mata_kuliah,
     }
     return json.dumps(hasil, ensure_ascii=False, indent=2)
+
+
+def simpan_latihan_ielts(
+    jenis: str, teks: str, hasil: dict[str, Any], penyedia: str
+) -> int:
+    with buka_db() as koneksi:
+        kursor = koneksi.execute(
+            """
+            INSERT INTO ielts_practice
+                (practice_type, input_text, feedback_json, provider, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                jenis,
+                teks.strip(),
+                json.dumps(hasil, ensure_ascii=False),
+                penyedia,
+                waktu_sekarang(),
+            ),
+        )
+    return int(kursor.lastrowid)
+
+
+def daftar_latihan_ielts(batas: int = 12) -> list[dict[str, Any]]:
+    with buka_db() as koneksi:
+        hasil = koneksi.execute(
+            """
+            SELECT id, practice_type, input_text, feedback_json, provider, created_at
+            FROM ielts_practice
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(batas),),
+        ).fetchall()
+    latihan = []
+    for item in hasil:
+        baris = dict(item)
+        try:
+            baris["feedback"] = json.loads(baris.pop("feedback_json"))
+        except json.JSONDecodeError:
+            baris["feedback"] = {}
+        latihan.append(baris)
+    return latihan
+
+
+def tambah_kosakata(
+    bahasa: str,
+    istilah: str,
+    pelafalan: str,
+    terjemahan: str,
+    contoh: str,
+    tag: str,
+) -> None:
+    nilai = [re.sub(r"\s+", " ", item.strip()) for item in (istilah, pelafalan, terjemahan, contoh)]
+    if bahasa not in {"Mandarin", "Vietnamese"} or not all(nilai):
+        raise ValueError(
+            tx(
+                "Bahasa, istilah, pelafalan, terjemahan, dan contoh wajib diisi.",
+                "Language, term, pronunciation, translation, and example are required.",
+            )
+        )
+    with buka_db() as koneksi:
+        koneksi.execute(
+            """
+            INSERT INTO language_vocabulary
+                (language, term, pronunciation, indonesian_translation,
+                 example_sentence, tags, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(language, term) DO UPDATE SET
+                pronunciation = excluded.pronunciation,
+                indonesian_translation = excluded.indonesian_translation,
+                example_sentence = excluded.example_sentence,
+                tags = excluded.tags,
+                created_at = excluded.created_at
+            """,
+            (bahasa, *nilai, re.sub(r"\s+", " ", tag.strip()), waktu_sekarang()),
+        )
+
+
+def daftar_kosakata(bahasa: str | None = None) -> list[dict[str, Any]]:
+    with buka_db() as koneksi:
+        if bahasa in {"Mandarin", "Vietnamese"}:
+            hasil = koneksi.execute(
+                """
+                SELECT * FROM language_vocabulary
+                WHERE language = ?
+                ORDER BY term COLLATE NOCASE
+                """,
+                (bahasa,),
+            ).fetchall()
+        else:
+            hasil = koneksi.execute(
+                "SELECT * FROM language_vocabulary ORDER BY language, term COLLATE NOCASE"
+            ).fetchall()
+    return [dict(item) for item in hasil]
 
 
 siapkan_database()
@@ -780,12 +917,19 @@ def kirim_json(
 
 
 def ambil_json(teks: str) -> dict[str, Any]:
+def ambil_objek_json(teks: str) -> dict[str, Any]:
     hasil = teks.strip()
     if hasil.startswith("```"):
         hasil = re.sub(r"^```(?:json)?\s*|\s*```$", "", hasil, flags=re.IGNORECASE)
     awal, akhir = hasil.find("{"), hasil.rfind("}")
     if awal < 0 or akhir <= awal:
         raise KesalahanPenyedia(tx("Layanan AI tidak mengirimkan paket belajar berbentuk JSON.", "The AI provider did not return a JSON study pack."))
+        raise KesalahanPenyedia(
+            tx(
+                "Layanan AI tidak mengirimkan JSON yang dapat dibaca.",
+                "The AI provider did not return readable JSON.",
+            )
+        )
     try:
         data = json.loads(hasil[awal : akhir + 1])
     except json.JSONDecodeError as exc:
@@ -793,6 +937,17 @@ def ambil_json(teks: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise KesalahanPenyedia(tx("Jawaban layanan AI bukan paket belajar yang valid.", "The AI response is not a valid study pack."))
     return rapikan_paket(data)
+        raise KesalahanPenyedia(
+            tx(
+                "Jawaban layanan AI bukan objek JSON yang valid.",
+                "The AI response is not a valid JSON object.",
+            )
+        )
+    return data
+
+
+def ambil_json(teks: str) -> dict[str, Any]:
+    return rapikan_paket(ambil_objek_json(teks))
 
 
 def rapikan_paket(paket: dict[str, Any]) -> dict[str, Any]:
@@ -907,6 +1062,214 @@ def buat_paket_belajar(
     raise KesalahanPenyedia(tx("Mesin belajar tidak dikenali.", "The study engine is not supported."))
 
 
+def rapikan_teks_inggris(teks: str) -> str:
+    hasil = re.sub(r"\s+", " ", teks.strip())
+    hasil = re.sub(r"\s+([,.;:!?])", r"\1", hasil)
+    hasil = re.sub(r"\bi\b", "I", hasil, flags=re.IGNORECASE)
+    hasil = re.sub(r"\bim\b", "I'm", hasil, flags=re.IGNORECASE)
+    hasil = re.sub(r"\bdont\b", "don't", hasil, flags=re.IGNORECASE)
+    hasil = re.sub(r"\bcant\b", "can't", hasil, flags=re.IGNORECASE)
+    hasil = re.sub(r"\bwont\b", "won't", hasil, flags=re.IGNORECASE)
+    bagian = re.split(r"(?<=[.!?])\s+", hasil)
+    return " ".join(item[:1].upper() + item[1:] if item else item for item in bagian)
+
+
+def koreksi_ielts_lokal(teks: str, jenis: str) -> dict[str, Any]:
+    kata = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", teks)
+    jumlah_kata = len(kata)
+    kata_unik = len({item.lower() for item in kata})
+    rasio_unik = kata_unik / max(jumlah_kata, 1)
+    penghubung = {
+        "however", "therefore", "moreover", "furthermore", "although", "whereas",
+        "consequently", "nevertheless", "firstly", "secondly", "finally", "because",
+    }
+    jumlah_penghubung = sum(1 for item in kata if item.lower() in penghubung)
+    pola_kesalahan = re.findall(
+        r"\b(?:im|dont|cant|wont|didnt|doesnt|isnt|arent|wasnt|werent)\b",
+        teks.lower(),
+    )
+    kalimat = pecah_kalimat(teks)
+
+    ambang = [45, 90, 150, 230] if jenis == "Writing" else [30, 60, 100, 160]
+    band = 4.0 + sum(0.5 for nilai in ambang if jumlah_kata >= nilai)
+    if rasio_unik >= 0.48 and jumlah_kata >= 80:
+        band += 0.5
+    if jumlah_penghubung >= 3:
+        band += 0.5
+    if pola_kesalahan:
+        band -= 0.5
+    band = max(3.5, min(7.0, round(band * 2) / 2))
+
+    tata_bahasa = []
+    if pola_kesalahan:
+        tata_bahasa.append(
+            tx(
+                "Periksa kontraksi dan apostrof, misalnya I'm, don't, can't, dan won't.",
+                "Check contractions and apostrophes, such as I'm, don't, can't, and won't.",
+            )
+        )
+    if len(kalimat) < 3:
+        tata_bahasa.append(
+            tx(
+                "Kembangkan gagasan menjadi beberapa kalimat lengkap dengan subjek dan predikat yang jelas.",
+                "Develop the response into several complete sentences with clear subjects and verbs.",
+            )
+        )
+    tata_bahasa.append(
+        tx(
+            "Periksa konsistensi tense, subject–verb agreement, artikel, dan tanda baca pada penyuntingan akhir.",
+            "Check tense consistency, subject–verb agreement, articles, and punctuation during the final edit.",
+        )
+    )
+
+    kosakata = [
+        tx(
+            f"Keragaman kosakata terdeteksi sekitar {rasio_unik:.0%}; prioritaskan ketepatan sebelum memakai kata yang terlalu rumit.",
+            f"Vocabulary variety is approximately {rasio_unik:.0%}; prioritize accuracy before using overly complex words.",
+        )
+    ]
+    if jumlah_penghubung < 3:
+        kosakata.append(
+            tx(
+                "Tambahkan penghubung secara alami, misalnya however, therefore, atau moreover.",
+                "Add linking words naturally, such as however, therefore, or moreover.",
+            )
+        )
+    else:
+        kosakata.append(
+            tx(
+                "Kata penghubung sudah muncul; pastikan setiap penghubung benar-benar menunjukkan hubungan logis.",
+                "Linking words are present; make sure each one expresses a genuine logical relationship.",
+            )
+        )
+
+    return {
+        "overview": tx(
+            f"Teks {jenis.lower()} berisi {jumlah_kata} kata. Mesin offline menilai kejelasan, panjang, variasi kosakata, dan penanda kohesi dasar.",
+            f"This {jenis.lower()} response contains {jumlah_kata} words. The offline engine reviewed clarity, length, vocabulary variety, and basic cohesion markers.",
+        ),
+        "grammar_feedback": tata_bahasa,
+        "vocabulary_feedback": kosakata,
+        "corrected_text": rapikan_teks_inggris(teks),
+        "estimated_band": band,
+        "next_steps": [
+            tx("Baca ulang teks dengan suara keras untuk menemukan kalimat yang janggal.", "Read the response aloud to catch awkward sentences."),
+            tx("Tulis ulang satu paragraf dengan struktur yang lebih jelas.", "Rewrite one paragraph with a clearer structure."),
+            tx("Bandingkan versi awal dan versi koreksi, lalu catat tiga pola kesalahan.", "Compare the original and corrected versions, then record three recurring errors."),
+        ],
+    }
+
+
+def rapikan_koreksi_ielts(data: dict[str, Any], teks_asli: str) -> dict[str, Any]:
+    def daftar(nama: str) -> list[str]:
+        nilai = data.get(nama, [])
+        return [str(item).strip() for item in nilai if str(item).strip()] if isinstance(nilai, list) else []
+
+    try:
+        band = float(data.get("estimated_band", 0))
+    except (TypeError, ValueError):
+        band = 0
+    band = max(0.0, min(9.0, round(band * 2) / 2))
+    hasil = {
+        "overview": str(data.get("overview", "")).strip(),
+        "grammar_feedback": daftar("grammar_feedback"),
+        "vocabulary_feedback": daftar("vocabulary_feedback"),
+        "corrected_text": str(data.get("corrected_text", "")).strip() or teks_asli.strip(),
+        "estimated_band": band,
+        "next_steps": daftar("next_steps"),
+    }
+    if not hasil["overview"] or not hasil["grammar_feedback"] or not hasil["vocabulary_feedback"]:
+        raise KesalahanPenyedia(
+            tx(
+                "Umpan balik IELTS dari layanan AI belum lengkap. Silakan coba lagi.",
+                "The AI provider returned incomplete IELTS feedback. Please try again.",
+            )
+        )
+    return hasil
+
+
+def buat_prompt_ielts(teks: str, jenis: str) -> str:
+    bahasa = "Indonesian" if not memakai_bahasa_inggris() else "English"
+    return f"""
+You are a careful IELTS tutor. Review the English {jenis.lower()} practice below.
+Return feedback in {bahasa}. Estimate an indicative IELTS band from 0 to 9 using half-band steps;
+make clear through the wording that this is not an official score. Preserve the writer's meaning.
+Return only one valid JSON object with this exact structure:
+{{
+  "overview": "brief overall assessment",
+  "grammar_feedback": ["specific issue and improvement"],
+  "vocabulary_feedback": ["specific lexical improvement"],
+  "corrected_text": "a corrected version of the full response",
+  "estimated_band": 6.0,
+  "next_steps": ["three focused practice actions"]
+}}
+
+PRACTICE TEXT:
+{teks.strip()[:18000]}
+""".strip()
+
+
+def koreksi_ielts_dengan_ai(
+    penyedia: str,
+    jenis: str,
+    teks: str,
+    kunci_api: str,
+    model: str,
+) -> dict[str, Any]:
+    if penyedia == "Lokal (tanpa API)":
+        return koreksi_ielts_lokal(teks, jenis)
+    if not kunci_api.strip():
+        raise KesalahanPenyedia(
+            tx(
+                f"Masukkan kunci API {penyedia} di bilah samping.",
+                f"Enter your {penyedia} API key in the sidebar.",
+            )
+        )
+    prompt = buat_prompt_ielts(teks, jenis)
+    if penyedia == "Google Gemini":
+        model_aman = urllib.parse.quote(model.strip(), safe="-_.")
+        data = kirim_json(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model_aman}:generateContent",
+            {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+            },
+            {"x-goog-api-key": kunci_api.strip()},
+        )
+        try:
+            teks_jawaban = "".join(
+                item.get("text", "")
+                for item in data["candidates"][0]["content"]["parts"]
+            )
+        except (KeyError, IndexError, TypeError) as exc:
+            raise KesalahanPenyedia(
+                tx("Gemini tidak mengirimkan koreksi yang dapat dibaca.", "Gemini did not return readable feedback.")
+            ) from exc
+    elif penyedia == "Groq":
+        data = kirim_json(
+            "https://api.groq.com/openai/v1/chat/completions",
+            {
+                "model": model.strip(),
+                "messages": [
+                    {"role": "system", "content": "Return only valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            },
+            {"Authorization": f"Bearer {kunci_api.strip()}"},
+        )
+        try:
+            teks_jawaban = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise KesalahanPenyedia(
+                tx("Groq tidak mengirimkan koreksi yang dapat dibaca.", "Groq did not return readable feedback.")
+            ) from exc
+    else:
+        raise KesalahanPenyedia(tx("Mesin belajar tidak dikenali.", "The study engine is not supported."))
+    return rapikan_koreksi_ielts(ambil_objek_json(teks_jawaban), teks)
+
+
 # -----------------------------------------------------------------------------
 # Tampilan dan komponen
 # -----------------------------------------------------------------------------
@@ -1001,6 +1364,21 @@ KUTIPAN_HARIAN = [
         "Versi masa depan Anda membutuhkan bukti, bukan janji. Berikan satu sesi belajar sebagai bukti hari ini.",
         "Your future self needs evidence, not promises. Give them one completed study session today.",
     ),
+]
+
+BANK_KOSAKATA_IELTS = [
+    {"term": "mitigate", "meaning": "mengurangi dampak", "example": "Governments should mitigate the effects of climate change.", "tag": "Academic verb"},
+    {"term": "ubiquitous", "meaning": "ada di mana-mana", "example": "Digital technology has become ubiquitous in modern education.", "tag": "Academic adjective"},
+    {"term": "compelling", "meaning": "sangat meyakinkan", "example": "The report presents compelling evidence for policy reform.", "tag": "Argument"},
+    {"term": "disparity", "meaning": "kesenjangan", "example": "The policy aims to reduce the disparity between urban and rural areas.", "tag": "Society"},
+    {"term": "sustainable", "meaning": "berkelanjutan", "example": "Cities need sustainable transport systems to reduce pollution.", "tag": "Environment"},
+    {"term": "exacerbate", "meaning": "memperburuk", "example": "Poor planning may exacerbate existing social problems.", "tag": "Cause and effect"},
+    {"term": "pragmatic", "meaning": "praktis dan realistis", "example": "A pragmatic solution should balance cost and public benefit.", "tag": "Evaluation"},
+    {"term": "pivotal", "meaning": "sangat penting", "example": "Teachers play a pivotal role in developing critical thinking.", "tag": "Importance"},
+    {"term": "a double-edged sword", "meaning": "sesuatu yang memiliki manfaat dan risiko", "example": "Social media can be a double-edged sword for young people.", "tag": "Idiom"},
+    {"term": "in the long run", "meaning": "dalam jangka panjang", "example": "Preventive healthcare saves public money in the long run.", "tag": "Idiom"},
+    {"term": "bridge the gap", "meaning": "menjembatani kesenjangan", "example": "Online courses can help bridge the gap in access to education.", "tag": "Idiom"},
+    {"term": "food for thought", "meaning": "bahan untuk dipikirkan", "example": "The documentary offers food for thought about consumer habits.", "tag": "Idiom"},
 ]
 
 
@@ -1322,6 +1700,15 @@ CSS_APLIKASI = """
         padding: .72rem .9rem; margin: .45rem 0 .85rem; color: var(--demitasse);
     }
 
+    .kartu-tebak {
+        background: var(--sand); border: 2px solid var(--demitasse); border-radius: 18px;
+        padding: 1.15rem 1.25rem; margin: .5rem 0 1rem;
+    }
+    .prompt-tebak {
+        color: var(--demitasse); font-size: clamp(1.55rem, 4vw, 2.35rem);
+        font-weight: 850; margin: .65rem 0 .35rem;
+    }
+
     @media (max-width: 700px) {
         .hero-ut { padding: 1.15rem; border-radius: 16px; }
         .hero-ut h1 { font-size: 2rem; }
@@ -1393,13 +1780,20 @@ def judul_langkah(nomor: int, judul: str, penjelasan: str) -> None:
 
 
 def pemutar_audio(teks: str, identitas: str) -> None:
+def pemutar_audio(teks: str, identitas: str, *, bahasa_inggris_saja: bool = False) -> None:
     teks_terenkripsi = base64.b64encode(teks.encode("utf-8")).decode("ascii")
     label_audio = tx("Pembaca audio", "Audio reader")
+    label_audio = tx("Pembaca audio Inggris", "English audio reader") if bahasa_inggris_saja else tx("Pembaca audio", "Audio reader")
     label_putar = tx("▶ Putar", "▶ Play")
     label_jeda = tx("Jeda / lanjut", "Pause / resume")
     label_henti = tx("Hentikan", "Stop")
     label_id = tx("Bahasa Indonesia", "Indonesian")
     label_en = tx("Bahasa Inggris", "English")
+    pilihan_bahasa = "" if bahasa_inggris_saja else (
+        f'<select id="bahasa-{identitas}" style="padding:7px;border-radius:8px;border:1px solid #40342b;background:#dbd5d1;color:#40342b">'
+        f'<option value="id-ID">{label_id}</option><option value="en-US">{label_en}</option></select>'
+    )
+    bahasa_ucapan = "'en-US'" if bahasa_inggris_saja else f"document.getElementById('bahasa-{identitas}').value"
     st.iframe(
         f"""
         <div style="font-family:Arial,sans-serif;background:#dbd5d1;border:1px solid #aa9d94;
@@ -1411,6 +1805,7 @@ def pemutar_audio(teks: str, identitas: str) -> None:
           <select id="bahasa-{identitas}" style="padding:7px;border-radius:8px;border:1px solid #40342b;background:#dbd5d1;color:#40342b">
             <option value="id-ID">{label_id}</option><option value="en-US">{label_en}</option>
           </select>
+          {pilihan_bahasa}
         </div>
         <script>
           const byteTeks = Uint8Array.from(atob('{teks_terenkripsi}'), karakter => karakter.charCodeAt(0));
@@ -1420,6 +1815,7 @@ def pemutar_audio(teks: str, identitas: str) -> None:
           document.getElementById('putar-{identitas}').onclick = () => {{
             suara.cancel(); ucapan = new SpeechSynthesisUtterance(teksBelajar);
             ucapan.lang = document.getElementById('bahasa-{identitas}').value;
+            ucapan.lang = {bahasa_ucapan};
             ucapan.rate = 0.95; suara.speak(ucapan);
           }};
           document.getElementById('jeda-{identitas}').onclick = () => suara.paused ? suara.resume() : suara.pause();
@@ -1567,6 +1963,313 @@ def kotak_petunjuk(indonesia: str, english: str) -> None:
     )
 
 
+def tampilkan_hasil_koreksi_ielts(hasil: dict[str, Any]) -> None:
+    kolom_band, kolom_ringkas = st.columns([1, 3])
+    kolom_band.metric(
+        tx("Estimasi band", "Estimated band"),
+        f"{float(hasil.get('estimated_band', 0)):.1f}",
+    )
+    kolom_ringkas.info(hasil.get("overview", ""))
+    st.caption(
+        tx(
+            "Estimasi ini adalah panduan latihan, bukan skor resmi IELTS.",
+            "This estimate is a practice guide, not an official IELTS score.",
+        )
+    )
+    kolom_tata_bahasa, kolom_kosakata = st.columns(2)
+    with kolom_tata_bahasa:
+        st.markdown(tx("#### Tata bahasa", "#### Grammar feedback"))
+        for item in hasil.get("grammar_feedback", []):
+            st.markdown(f"- {item}")
+    with kolom_kosakata:
+        st.markdown(tx("#### Peningkatan kosakata", "#### Vocabulary improvements"))
+        for item in hasil.get("vocabulary_feedback", []):
+            st.markdown(f"- {item}")
+    with st.expander(tx("Lihat versi yang dikoreksi", "View corrected version"), expanded=True):
+        st.write(hasil.get("corrected_text", ""))
+    if hasil.get("next_steps"):
+        st.markdown(tx("#### Langkah latihan berikutnya", "#### Next practice steps"))
+        for indeks, item in enumerate(hasil["next_steps"], start=1):
+            st.markdown(f"{indeks}. {item}")
+
+
+def tampilkan_pusat_ielts(
+    penyedia: str,
+    nama_penyedia: dict[str, str],
+    kunci_api: str,
+    model: str,
+) -> None:
+    with st.container(border=True):
+        st.markdown(tx("### ✍️ Latihan Writing & Speaking", "### ✍️ Writing & Speaking practice"))
+        kotak_petunjuk(
+            "📌 Pilih jenis latihan, tempel esai atau transkrip speaking, lalu tekan Koreksi AI.",
+            "📌 Choose a practice type, paste an essay or speaking transcript, then select AI Correction.",
+        )
+        nama_jenis = {
+            "Writing": tx("Writing — esai", "Writing — essay"),
+            "Speaking": tx("Speaking — transkrip latihan", "Speaking — practice transcript"),
+        }
+        jenis = st.selectbox(
+            tx("Jenis latihan", "Practice type"),
+            ["Writing", "Speaking"],
+            format_func=lambda pilihan: nama_jenis[pilihan],
+            key=f"jenis_latihan_ielts_{'en' if memakai_bahasa_inggris() else 'id'}",
+        )
+        teks_latihan = st.text_area(
+            tx("Teks latihan bahasa Inggris", "English practice text"),
+            height=260,
+            placeholder=tx(
+                "Tempel esai IELTS atau transkrip jawaban speaking Anda di sini…",
+                "Paste your IELTS essay or speaking-answer transcript here…",
+            ),
+            key="teks_latihan_ielts",
+        )
+        jumlah_kata = len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", teks_latihan))
+        st.caption(tx(f"{jumlah_kata} kata", f"{jumlah_kata} words"))
+        koreksi_diklik = st.button(
+            tx("✨ Koreksi AI", "✨ AI Correction"),
+            type="primary",
+            width="stretch",
+            key="tombol_koreksi_ielts",
+        )
+        if koreksi_diklik:
+            if jumlah_kata < 30:
+                st.error(
+                    tx(
+                        "Masukkan sedikitnya 30 kata agar umpan balik cukup bermakna.",
+                        "Enter at least 30 words so the feedback can be meaningful.",
+                    )
+                )
+            else:
+                try:
+                    with st.spinner(
+                        tx(
+                            f"Menganalisis latihan dengan {nama_penyedia[penyedia]}…",
+                            f"Reviewing your practice with {nama_penyedia[penyedia]}…",
+                        )
+                    ):
+                        hasil = koreksi_ielts_dengan_ai(
+                            penyedia, jenis, teks_latihan, kunci_api, model
+                        )
+                        id_latihan = simpan_latihan_ielts(
+                            jenis, teks_latihan, hasil, penyedia
+                        )
+                    st.session_state["hasil_koreksi_ielts"] = {
+                        "id": id_latihan,
+                        "jenis": jenis,
+                        "hasil": hasil,
+                    }
+                    st.success(
+                        tx(
+                            "Koreksi selesai dan tersimpan di riwayat SQLite.",
+                            "Your correction is complete and saved to SQLite history.",
+                        )
+                    )
+                except KesalahanPenyedia as exc:
+                    st.error(str(exc))
+
+        hasil_aktif = st.session_state.get("hasil_koreksi_ielts")
+        if hasil_aktif:
+            st.markdown(tx("### Hasil koreksi", "### Correction results"))
+            tampilkan_hasil_koreksi_ielts(hasil_aktif["hasil"])
+
+    with st.container(border=True):
+        st.markdown(tx("### 📚 Bank Kosakata & Idiom IELTS Academic", "### 📚 Academic IELTS Vocabulary & Idioms"))
+        kotak_petunjuk(
+            "📌 Pelajari arti dan contoh, lalu gunakan pembaca audio untuk menirukan pelafalan bahasa Inggris.",
+            "📌 Study each meaning and example, then use the audio reader to imitate English pronunciation.",
+        )
+        st.dataframe(
+            [
+                {
+                    tx("Kosakata/idiom", "Vocabulary/idiom"): item["term"],
+                    tx("Arti Indonesia", "Indonesian meaning"): item["meaning"],
+                    tx("Contoh", "Example"): item["example"],
+                    tx("Topik", "Topic"): item["tag"],
+                }
+                for item in BANK_KOSAKATA_IELTS
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        teks_audio = ". ".join(
+            f"{item['term']}. {item['example']}" for item in BANK_KOSAKATA_IELTS
+        )
+        pemutar_audio(teks_audio, "bank-ielts", bahasa_inggris_saja=True)
+
+    riwayat = daftar_latihan_ielts()
+    if riwayat:
+        with st.expander(tx("Riwayat latihan IELTS", "IELTS practice history")):
+            for item in riwayat:
+                hasil = item.get("feedback", {})
+                st.markdown(
+                    f"**{item['practice_type']} · Band {float(hasil.get('estimated_band', 0)):.1f}**  "
+                    f"\n{item['created_at'].replace('T', ' ')[:16]} · {item['provider']}"
+                )
+                st.caption(item["input_text"][:220] + ("…" if len(item["input_text"]) > 220 else ""))
+                st.divider()
+
+
+def tampilkan_kosakata_multibahasa() -> None:
+    kotak_petunjuk(
+        "📌 Simpan kosakata Mandarin atau Vietnam, cari di tabel, lalu latih ingatan melalui kartu Tebak Kata.",
+        "📌 Save Mandarin or Vietnamese vocabulary, explore the table, then practice with Guess the Word cards.",
+    )
+    nama_filter = {
+        "Semua": tx("Semua bahasa", "All languages"),
+        "Mandarin": "Mandarin",
+        "Vietnamese": tx("Bahasa Vietnam", "Vietnamese"),
+    }
+    filter_bahasa = st.selectbox(
+        tx("Tampilkan bahasa", "Show language"),
+        ["Semua", "Mandarin", "Vietnamese"],
+        format_func=lambda pilihan: nama_filter[pilihan],
+        key=f"filter_kosakata_bahasa_{'en' if memakai_bahasa_inggris() else 'id'}",
+    )
+    kosakata = daftar_kosakata(None if filter_bahasa == "Semua" else filter_bahasa)
+    st.dataframe(
+        [
+            {
+                tx("Bahasa", "Language"): item["language"],
+                tx("Kosakata", "Term"): item["term"],
+                tx("Pelafalan/Pinyin", "Pronunciation/Pinyin"): item["pronunciation"],
+                tx("Arti Indonesia", "Indonesian translation"): item["indonesian_translation"],
+                tx("Contoh kalimat", "Example sentence"): item["example_sentence"],
+                tx("Tag/Topik", "Tags/Topic"): item["tags"],
+            }
+            for item in kosakata
+        ],
+        width="stretch",
+        hide_index=True,
+    )
+    st.caption(
+        tx(
+            f"{len(kosakata)} kosakata tersimpan permanen di SQLite.",
+            f"{len(kosakata)} vocabulary entries are stored in SQLite.",
+        )
+    )
+
+    pesan_kosakata = st.session_state.pop("_pesan_kosakata", None)
+    if pesan_kosakata:
+        st.success(pesan_kosakata)
+
+    with st.expander(tx("Tambah kosakata baru", "Add New Vocabulary"), expanded=False):
+        with st.form("form_kosakata_baru", clear_on_submit=True):
+            bahasa_baru = st.selectbox(
+                tx("Bahasa", "Language"), ["Mandarin", "Vietnamese"]
+            )
+            kolom_istilah, kolom_lafal = st.columns(2)
+            istilah = kolom_istilah.text_input(
+                tx("Kosakata", "Vocabulary term"),
+                placeholder=tx("Contoh: 梦想", "Example: 梦想"),
+            )
+            pelafalan = kolom_lafal.text_input(
+                tx("Pelafalan atau Pinyin", "Pronunciation or Pinyin"),
+                placeholder=tx("Contoh: mèngxiǎng", "Example: mèngxiǎng"),
+            )
+            terjemahan = st.text_input(
+                tx("Terjemahan bahasa Indonesia", "Indonesian translation"),
+                placeholder=tx("Contoh: impian", "Example: impian"),
+            )
+            contoh = st.text_area(
+                tx("Contoh kalimat", "Example sentence"),
+                placeholder=tx(
+                    "Masukkan satu contoh kalimat dalam bahasa target…",
+                    "Enter one example sentence in the target language…",
+                ),
+                height=95,
+            )
+            tag = st.text_input(
+                tx("Tag atau topik", "Tags or topic"),
+                placeholder=tx("Contoh: impian, motivasi", "Example: dreams, motivation"),
+            )
+            tambah_diklik = st.form_submit_button(
+                tx("Simpan kosakata", "Save vocabulary"), type="primary"
+            )
+        if tambah_diklik:
+            try:
+                tambah_kosakata(
+                    bahasa_baru, istilah, pelafalan, terjemahan, contoh, tag
+                )
+                st.session_state["_pesan_kosakata"] = tx(
+                    "Kosakata berhasil disimpan.", "Vocabulary saved successfully."
+                )
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+    st.markdown(tx("### 🧠 Tebak Kata", "### 🧠 Guess the Word"))
+    if not kosakata:
+        st.info(tx("Tambahkan kosakata untuk mulai bermain.", "Add vocabulary to start playing."))
+        return
+    kunci_indeks = f"indeks_tebak_{filter_bahasa}"
+    if kunci_indeks not in st.session_state:
+        st.session_state[kunci_indeks] = 0
+    indeks = int(st.session_state[kunci_indeks]) % len(kosakata)
+    kartu = kosakata[indeks]
+    st.markdown(
+        "<div class='kartu-tebak'>"
+        f"<span class='label-kecil'>{html.escape(kartu['language'])}</span>"
+        f"<div class='prompt-tebak'>{html.escape(kartu['indonesian_translation'])}</div>"
+        f"<div class='teks-bantu'>{html.escape(kartu['example_sentence'])}</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    pilihan_jawaban = st.selectbox(
+        tx("Pilih kosakata yang tepat", "Choose the matching word"),
+        options=[item["term"] for item in kosakata],
+        index=None,
+        placeholder=tx("Pilih jawaban…", "Choose an answer…"),
+        key=f"jawaban_tebak_{filter_bahasa}_{indeks}_{len(kosakata)}",
+    )
+    kolom_periksa, kolom_lanjut, ruang = st.columns([1, 1, 3])
+    if kolom_periksa.button(
+        tx("Periksa jawaban", "Check answer"), key=f"periksa_tebak_{filter_bahasa}"
+    ):
+        if pilihan_jawaban == kartu["term"]:
+            st.success(tx("Benar! Kerja bagus.", "Correct! Great work."))
+        else:
+            st.error(
+                tx(
+                    f"Jawaban yang tepat: {kartu['term']} ({kartu['pronunciation']}).",
+                    f"The correct answer is {kartu['term']} ({kartu['pronunciation']}).",
+                )
+            )
+    if kolom_lanjut.button(
+        tx("Kartu berikutnya", "Next card"), key=f"lanjut_tebak_{filter_bahasa}"
+    ):
+        st.session_state[kunci_indeks] = (indeks + 1) % len(kosakata)
+        st.rerun()
+
+
+def tampilkan_hub_bahasa(
+    penyedia: str,
+    nama_penyedia: dict[str, str],
+    kunci_api: str,
+    model: str,
+) -> None:
+    st.markdown(
+        f"""
+        <div class="hero-ut">
+          <div class="kicker">{html.escape(tx('PUSAT BELAJAR BAHASA', 'LANGUAGE LEARNING HUB'))}</div>
+          <h1>{html.escape(tx('Linguist & IELTS Hub', 'Linguist & IELTS Hub'))}</h1>
+          <p>{html.escape(tx('Latih IELTS, perluas kosakata akademik, dan bangun kebiasaan belajar Mandarin serta Vietnam.', 'Practice IELTS, expand your academic vocabulary, and build Mandarin and Vietnamese learning habits.'))}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    tab_ielts, tab_multibahasa = st.tabs(
+        [
+            tx("1 · Pusat Persiapan IELTS", "1 · IELTS Prep Center"),
+            tx("2 · Kosakata Multibahasa", "2 · Multilingual Vocabulary (Mandarin & Vietnamese)"),
+        ]
+    )
+    with tab_ielts:
+        tampilkan_pusat_ielts(penyedia, nama_penyedia, kunci_api, model)
+    with tab_multibahasa:
+        tampilkan_kosakata_multibahasa()
+
+
 st.markdown(CSS_APLIKASI, unsafe_allow_html=True)
 daftar_semester_tersedia = daftar_semester()
 semester_per_id = {item["id"]: item for item in daftar_semester_tersedia}
@@ -1591,10 +2294,12 @@ with st.sidebar:
         "Ruang belajar": tx("Ruang belajar", "Study space"),
         "Atur semester": tx("Atur semester", "Semester setup"),
         "Katalog SI": tx("Katalog SI", "IS catalog"),
+        "Linguist & IELTS Hub": "Linguist & IELTS Hub",
     }
     halaman = st.radio(
         tx("Menu utama", "Main menu"),
         ["Ruang belajar", "Atur semester", "Katalog SI"],
+        ["Ruang belajar", "Atur semester", "Katalog SI", "Linguist & IELTS Hub"],
         format_func=lambda pilihan: nama_halaman[pilihan],
         index=0 if ada_mata_kuliah_aktif else 1,
         key="menu_utama",
@@ -2124,6 +2829,7 @@ elif halaman == "Atur semester":
     )
 
 else:
+elif halaman == "Katalog SI":
     st.markdown(
         f"""
         <div class="hero-ut">
@@ -2187,3 +2893,6 @@ else:
                         f"- `{opsi['kode']}` — {nama_tampilan(opsi['kode'], opsi['nama'])} "
                         f"({item['sks']} {tx('SKS', 'credits')})"
                     )
+
+else:
+    tampilkan_hub_bahasa(penyedia, nama_penyedia, kunci_api, model)
