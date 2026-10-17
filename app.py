@@ -918,6 +918,7 @@ def kirim_json(
 
 def ambil_json(teks: str) -> dict[str, Any]:
 def ambil_objek_json(teks: str) -> dict[str, Any]:
+    """Ambil satu objek JSON dari respons teks layanan AI."""
     hasil = teks.strip()
     if hasil.startswith("```"):
         hasil = re.sub(r"^```(?:json)?\s*|\s*```$", "", hasil, flags=re.IGNORECASE)
